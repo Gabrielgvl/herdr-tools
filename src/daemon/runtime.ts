@@ -40,6 +40,7 @@ import { createOwnership } from "./ownership.js";
 import type { Mailbox, MailboxEventWriter } from "./mailbox.js";
 import type { DaemonNamespace } from "./namespace.js";
 import type { LaneRetirer } from "./retire.js";
+import { captureTraceHistory } from "../supervision/trace-tail.js";
 import { DAEMON_REASON_TOKEN, DaemonRequestError } from "./protocol.js";
 import type { DaemonRequestHandler } from "./server.js";
 
@@ -111,7 +112,12 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
   queueFlush.begin();
   const wiring = deps.wire?.({ cli, queueFlush }) ?? {};
   const jobs = wiring.jobs ?? new JobRegistry();
-  const handoffs = createHandoffGate();
+  const handoffs = createHandoffGate({
+    // ADR-040 amendment: the native-history fingerprint persisted beside the
+    // acceptance anchor; the lane retirer proves the trace still extends it.
+    traceHistory: (identity, workspace, signal) => captureTraceHistory(identity, workspace, signal),
+    ...(deps.log === undefined ? {} : { log: deps.log }),
+  });
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
@@ -122,7 +128,17 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
     ...(wiring.hints === undefined ? {} : { hints: wiring.hints }),
     ...(deps.log === undefined ? {} : { log: deps.log }),
     handoffs,
-    repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
+    // The repair prompt rides the shared pane-write section so a lane-
+    // retirement close holding the lease can never dispatch between its final
+    // trace read and this prompt's acknowledgement (ADR-040 amendment, R2).
+    repairPrompt: async (paneId, text, signal) => {
+      const lease = await queueFlush.writeSection(paneId);
+      try {
+        return await cli.prompt(paneId, text, signal);
+      } finally {
+        await lease.release();
+      }
+    },
   });
   return { cli, queueFlush, jobs, ownership, handoffs, supervision };
 }
@@ -246,6 +262,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       // supplies it — production passes the C9-proved three (N5.2).
       hints = deps.hints ?? createIdleHints({
         cli: parts.cli,
+        writeSection: (paneId) => parts.queueFlush.writeSection(paneId),
         mailbox: deferredMailbox,
         namespace: deps.namespace,
         qualifiedKinds: deps.hintKinds,

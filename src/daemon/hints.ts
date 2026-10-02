@@ -67,6 +67,13 @@ export interface IdleHintCli {
 
 export interface IdleHintsOptions {
   cli: IdleHintCli;
+  /**
+   * The shared pane-write section every daemon prompt rides (ADR-040
+   * amendment, R2): a lane-retirement close holding the lease cannot dispatch
+   * between its final trace read and a hint's acknowledgement. Absent (tests)
+   * writes are unguarded.
+   */
+  writeSection?: (paneId: string) => Promise<{ release(): Promise<void> }>;
   /** Unread listing for the hint body's count and IDs (`Mailbox` satisfies it). */
   mailbox: { list(managerSessionKey: string): Promise<string[]> };
   /** The daemon namespace the mailbox path is rendered from. */
@@ -166,7 +173,16 @@ export function createIdleHints(options: IdleHintsOptions): IdleHintSink {
       const body = `herdr mailbox: ${ids.length} unread (${ids.join(", ")}) at ${unread}; read via your MCP surface (herdr_status / executor → MCP)`;
       lastSent.set(key, now());
       stage = "prompt";
-      await options.cli.prompt(owner.paneId, body, signal);
+      if (options.writeSection === undefined) {
+        await options.cli.prompt(owner.paneId, body, signal);
+      } else {
+        const lease = await options.writeSection(owner.paneId);
+        try {
+          await options.cli.prompt(owner.paneId, body, signal);
+        } finally {
+          await lease.release();
+        }
+      }
     } catch (error) {
       drop(owner.paneId, key, classifyHintDrop(error, stage));
     }

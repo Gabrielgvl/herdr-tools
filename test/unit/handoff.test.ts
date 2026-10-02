@@ -1,4 +1,5 @@
 import { chmod, lstat, link, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FileHandle } from "node:fs/promises";
@@ -825,6 +826,9 @@ describe("artifact read", () => {
     expect(artifact.status).toBe("done");
     expect(artifact.bytes).toBe(Buffer.byteLength(body, "utf8"));
     expect(artifact.sha256).toMatch(/^[0-9a-f]{64}$/);
+    // ADR-040 amendment: the retirement anchor candidate is the floored number-based mtime of the read descriptor.
+    expect(artifact.mtimeMs).toBe(Math.floor(statSync(run.artifactPath).mtimeMs));
+    expect(Number.isSafeInteger(artifact.mtimeMs)).toBe(true);
   });
 
   it("reports a missing artifact distinctly from an invalid one", async () => {
@@ -1174,5 +1178,75 @@ describe("contract injection", () => {
     // The injected template is itself a contract-valid skeleton only after the
     // agent replaces the guidance bodies; assert the shape, not acceptance.
     expect(block.match(/## /g)).toHaveLength(6);
+  });
+});
+
+describe("artifact anchor and trace history (ADR-040 amendment)", () => {
+  const sessionRecord = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/session.jsonl" };
+  const hex = "f".repeat(64);
+  const piHistory = { kind: "pi-jsonl", session: sessionRecord, position: { path: "/pi/session.jsonl", offset: 1024, anchor: hex } } as const;
+
+  async function seeded(agentKind = "pi"): Promise<HandoffAllocation> {
+    const dir = await root();
+    const run = await allocatorFor(dir).allocate();
+    await allocatorFor(dir).persist(run, { ...identity, child: { ...identity.child, agentKind } });
+    return run;
+  }
+
+  async function rewrite(run: HandoffAllocation, mutate: (state: Record<string, unknown>) => void): Promise<void> {
+    const state = JSON.parse(await readFile(run.statePath, "utf8")) as Record<string, unknown>;
+    mutate(state);
+    await writeFile(run.statePath, JSON.stringify(state), { mode: 0o600 });
+  }
+
+  it("round-trips the anchor and fingerprint, and reads a record without them", async () => {
+    const run = await seeded();
+    expect((await readHandoffState(run)).artifact).toEqual({ path: run.artifactPath, sha256: null, bytes: null, version: 0 });
+    await updateHandoffState(run, (state) => {
+      state.artifact.mtimeMs = 1_790_856_000_000;
+      state.artifact.traceHistory = { ...piHistory, session: { ...sessionRecord } };
+    });
+    expect((await readHandoffState(run)).artifact).toMatchObject({ mtimeMs: 1_790_856_000_000, traceHistory: piHistory });
+    const claude = await seeded("claude");
+    await updateHandoffState(claude, (state) => {
+      state.artifact.traceHistory = { kind: "claude-jsonl", session: { ...sessionRecord, source: "herdr:claude", agent: "claude", kind: "id", value: "u" }, position: { path: "/home/x/.claude/projects/-p/u.jsonl", offset: 0, anchor: hex } };
+    });
+    expect((await readHandoffState(claude)).artifact.traceHistory?.kind).toBe("claude-jsonl");
+    const devin = await seeded("devin");
+    await updateHandoffState(devin, (state) => {
+      state.artifact.mtimeMs = 0;
+      state.artifact.traceHistory = { kind: "devin-session", session: { ...sessionRecord, agent: "devin", kind: "id", value: "s" }, position: { session: "s", steps: 3, anchor: hex } };
+    });
+    expect((await readHandoffState(devin)).artifact).toMatchObject({ mtimeMs: 0, traceHistory: { position: { steps: 3 } } });
+  });
+
+  it("refuses a malformed anchor or fingerprint as a malformed sidecar, never as a missing one", async () => {
+    const bad: Array<[string, (artifact: Record<string, unknown>) => void]> = [
+      ["negative mtime", (artifact) => { artifact.mtimeMs = -1; }],
+      ["fractional mtime", (artifact) => { artifact.mtimeMs = 1.5; }],
+      ["string mtime", (artifact) => { artifact.mtimeMs = "1"; }],
+      ["unknown artifact key", (artifact) => { artifact.extra = 1; }],
+      ["history with an extra key", (artifact) => { artifact.traceHistory = { ...piHistory, extra: 1 }; }],
+      ["history of another kind than the child", (artifact) => { artifact.traceHistory = { ...piHistory, kind: "claude-jsonl" }; }],
+      ["history with an unknown kind", (artifact) => { artifact.traceHistory = { ...piHistory, kind: "agy" }; }],
+      ["history with a malformed session", (artifact) => { artifact.traceHistory = { ...piHistory, session: { ...sessionRecord, value: "bad\nline" } }; }],
+      ["history with a short anchor", (artifact) => { artifact.traceHistory = { ...piHistory, position: { ...piHistory.position, anchor: "abc" } }; }],
+      ["history with a relative path", (artifact) => { artifact.traceHistory = { ...piHistory, position: { ...piHistory.position, path: "rel.jsonl" } }; }],
+      ["history with a negative offset", (artifact) => { artifact.traceHistory = { ...piHistory, position: { ...piHistory.position, offset: -1 } }; }],
+      ["JSONL history carrying a Devin position", (artifact) => { artifact.traceHistory = { ...piHistory, position: { session: "s", steps: 1, anchor: hex } }; }],
+      ["history position with an extra key", (artifact) => { artifact.traceHistory = { ...piHistory, position: { ...piHistory.position, extra: 1 } }; }],
+      ["history that is not an object", (artifact) => { artifact.traceHistory = "x"; }],
+    ];
+    for (const [name, mutate] of bad) {
+      const run = await seeded();
+      await rewrite(run, (state) => mutate(state.artifact as Record<string, unknown>));
+      await expect(readHandoffState(run), name).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+    }
+    // Devin position shapes are validated against the Devin kind.
+    for (const position of [{ session: "", steps: 1, anchor: hex }, { session: "s", steps: 1.5, anchor: hex }, { path: "/x", offset: 1, anchor: hex }]) {
+      const run = await seeded("devin");
+      await rewrite(run, (state) => { (state.artifact as Record<string, unknown>).traceHistory = { kind: "devin-session", session: { ...sessionRecord, agent: "devin", kind: "id", value: "s" }, position }; });
+      await expect(readHandoffState(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+    }
   });
 });

@@ -1,8 +1,7 @@
-import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentSessionRecord } from "./protocol.js";
+import { openTrustedTraceFile, TRACE_FILE_FORBID_GROUP_WORLD_WRITE } from "./trace-file.js";
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TAIL_BYTES = 512 * 1024;
@@ -118,27 +117,28 @@ function benignRecord(record: Record<string, unknown>): boolean {
   return record.type === "assistant" && record.isApiErrorMessage === true && !blockTypes(record).includes("tool_use");
 }
 
-/** Claude Code 2.1.281 emitted these typed fields in two observed Fable quota sessions.
- * Its JSONL format is external and may change; unknown shapes fail closed.
- * The project slug is only a candidate location, never identity evidence. */
-export async function claudeQuotaSignal(session: AgentSessionRecord, cwd: string, notBeforeMs: number, home = homedir()): Promise<ClaudeQuotaSignal> {
+/**
+ * The Claude Code session record's candidate location: `~/.claude/projects/
+ * <cwd slug>/<sessionId>.jsonl`, with the owner-only directory chain the
+ * trust check walks before the leaf. `undefined` when the session is not a
+ * Claude id-keyed session or the cwd is not absolute. The project slug is
+ * only a candidate location, never identity evidence.
+ */
+export function claudeSessionTrace(session: AgentSessionRecord, cwd: string, home = homedir()): { path: string; directories: string[] } | undefined {
   if (session.source !== "herdr:claude" || session.agent !== "claude" || session.kind !== "id"
-    || !SESSION_ID.test(session.value) || !cwd.startsWith("/")) return false;
+    || !SESSION_ID.test(session.value) || !cwd.startsWith("/")) return undefined;
   const directory = join(home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
-  const path = join(directory, `${session.value}.jsonl`);
+  return { path: join(directory, `${session.value}.jsonl`), directories: [home, join(home, ".claude"), join(home, ".claude", "projects"), directory] };
+}
+
+/** Claude Code 2.1.281 emitted these typed fields in two observed Fable quota sessions.
+ * Its JSONL format is external and may change; unknown shapes fail closed. */
+export async function claudeQuotaSignal(session: AgentSessionRecord, cwd: string, notBeforeMs: number, home = homedir()): Promise<ClaudeQuotaSignal> {
+  const trace = claudeSessionTrace(session, cwd, home);
+  if (trace === undefined) return false;
   try {
-    for (const entry of [home, join(home, ".claude"), join(home, ".claude", "projects"), directory]) {
-      const stats = await lstat(entry);
-      if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o22) !== 0) return false;
-    }
-    const stats = await lstat(path);
-    if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o22) !== 0) return false;
-    /* c8 ignore next -- O_NOFOLLOW exists on every platform that ships flock. */
-    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const { handle, stat: opened } = await openTrustedTraceFile(trace.path, { directories: trace.directories, forbidModeBits: TRACE_FILE_FORBID_GROUP_WORLD_WRITE });
     try {
-      const opened = await handle.stat();
-      /* c8 ignore next -- the opened inode diverges from the lstat record only when the file is swapped between the two reads; O_NOFOLLOW pins it otherwise. */
-      if (!opened.isFile() || opened.dev !== stats.dev || opened.ino !== stats.ino || opened.uid !== process.getuid?.() || (opened.mode & 0o22) !== 0) return false;
       const start = Math.max(0, opened.size - TAIL_BYTES);
       const bytes = Buffer.alloc(Math.min(opened.size, TAIL_BYTES));
       const { bytesRead } = await handle.read(bytes, 0, bytes.length, start);

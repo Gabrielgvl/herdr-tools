@@ -27,11 +27,14 @@ import { randomUUID } from "node:crypto";
 import {
   HandoffError,
   readHandoffArtifact,
+  readHandoffState,
   updateHandoffState,
   type HandoffAllocation,
   type HandoffLifecycleState,
   type HandoffState,
-  type HandoffStatus
+  type HandoffStatus,
+  type HandoffTraceHistory,
+  type HandoffWorkspaceRecord
 } from "./handoff.js";
 
 /** The exact launched identity a run binds to; pane id may change on moves. */
@@ -214,8 +217,52 @@ export interface HandoffGate {
   shutdown(): Promise<void>;
 }
 
-export function createHandoffGate(): HandoffGate {
+/**
+ * The ADR-040 amendment seam: capture where the child's native trace ends
+ * when a new artifact content is first validated. The gate awaits it before
+ * the acceptance mutation and persists it beside `artifact.mtimeMs`; a
+ * capture that throws or returns `undefined` persists the anchor without a
+ * fingerprint (the retire check then refuses `trace_history_missing`) and is
+ * journaled once per run.
+ */
+export type HandoffTraceHistoryCapture = (
+  identity: HandoffBoundIdentity,
+  workspace: HandoffWorkspaceRecord | undefined,
+  signal: AbortSignal,
+) => Promise<HandoffTraceHistory | undefined>;
+
+export interface HandoffGateDeps {
+  traceHistory?: HandoffTraceHistoryCapture;
+  /** Bounded structured journal sink; `key=value` records, never content. */
+  log?: (line: string) => void;
+}
+
+const BOUNDED_REASON = /^[\w.:-]{1,64}$/u;
+
+export function createHandoffGate(deps: HandoffGateDeps = {}): HandoffGate {
   const runs = new Map<string, HandoffRun>();
+  const log = deps.log ?? (() => undefined);
+  /** Runs whose history capture already failed once — one journal line, not one per validate. */
+  const captureFailed = new Set<string>();
+  const signal = new AbortController().signal;
+
+  async function captureHistory(run: HandoffRun): Promise<HandoffTraceHistory | undefined> {
+    if (deps.traceHistory === undefined) return undefined;
+    let history: HandoffTraceHistory | undefined;
+    let reason = "capture_undefined";
+    try {
+      const current = await readHandoffState(run.allocation);
+      history = await deps.traceHistory(run.identity, current.child.workspace, signal);
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      reason = typeof code === "string" && BOUNDED_REASON.test(code) ? `capture_threw:${code}` : "capture_threw";
+    }
+    if (history === undefined && !captureFailed.has(run.runId)) {
+      captureFailed.add(run.runId);
+      log(`herdr-tools handoff_trace_history run=${run.runId} decision=capture_failed reason=${reason}`);
+    }
+    return history;
+  }
 
   async function recordOutcome(run: HandoffRun, outcome: HandoffOutcome, detail?: string): Promise<void> {
     const state = await updateHandoffState(run.allocation, (current) => {
@@ -291,13 +338,18 @@ export function createHandoffGate(): HandoffGate {
         }
         throw error;
       }
+      // ADR-040 amendment: the native-history fingerprint is captured before
+      // the mutation (the mutator is synchronous) and only when this content
+      // looks new — a byte-identical re-presentation never re-captures.
+      const history = run.accepted?.sha256 === artifact.sha256 ? undefined : await captureHistory(run);
       let stale = false;
       let state;
       try {
         state = await updateHandoffState(run.allocation, (current) => {
           if (current.artifact.sha256 === artifact.sha256) {
             // Content identical to the last acceptance: still current while no
-            // new cycle is open, stale once the child has worked again.
+            // new cycle is open, stale once the child has worked again. The
+            // anchor stays at the time this content was FIRST observed.
             stale = run.cycleOpen;
             return;
           }
@@ -305,6 +357,10 @@ export function createHandoffGate(): HandoffGate {
           current.artifact.bytes = artifact.bytes;
           current.artifact.version += 1;
           current.artifact.status = artifact.status;
+          // The retirement anchor: the write time first observed for this content.
+          current.artifact.mtimeMs = artifact.mtimeMs;
+          if (history === undefined) delete current.artifact.traceHistory;
+          else current.artifact.traceHistory = history;
         });
       } catch (error) {
         if (error instanceof HandoffError) return remembered(run, { state: "unavailable" });

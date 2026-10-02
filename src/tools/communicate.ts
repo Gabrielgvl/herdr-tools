@@ -218,12 +218,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             }
             promptDispatch = { state: "acknowledged", requestId };
           };
-          // For a Devin target the final verify+write is the shared locked
-          // section: a flush's proof/Enter in another host can never interleave
-          // between the check and the bracketed-paste submission. The kind comes
-          // from the latest verified identity — a replacement swapping kinds
-          // between reads degrades to an unlocked write, never a wrong one.
-          if (promptIdentity!.agentKind === "devin" && deps.queueFlush !== undefined) {
+          // The final verify+write is the shared pane-write section for every
+          // kind: a Devin flush's proof/Enter in another host can never
+          // interleave between the check and the bracketed-paste submission,
+          // and (ADR-040 amendment, R2) a lane-retirement close holding the
+          // same lease can never dispatch between its final trace read and
+          // this prompt's acknowledgement — the prompt waits for the lease
+          // and then lands in the trace the next sweep reads.
+          if (deps.queueFlush !== undefined) {
             const lease = await deps.queueFlush.writeSection(target.paneId!);
             try {
               await sendPrompt();

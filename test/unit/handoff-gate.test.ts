@@ -1,10 +1,10 @@
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as HandoffModule from "../../src/handoff.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHandoffAllocator, HandoffError, HANDOFF_MAX_BYTES, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffRunIdentity } from "../../src/handoff.js";
-import { createHandoffGate, handoffGateMatches, projectHandoffEvidence, HANDOFF_MAX_REPAIR_ATTEMPTS, type HandoffBoundIdentity, type HandoffRun } from "../../src/handoff-gate.js";
+import { createHandoffGate, handoffGateMatches, projectHandoffEvidence, HANDOFF_MAX_REPAIR_ATTEMPTS, type HandoffBoundIdentity, type HandoffGateDeps, type HandoffRun } from "../../src/handoff-gate.js";
 
 /**
  * The gate's own refusal taxonomy, exercised for failures the primitive can
@@ -413,5 +413,107 @@ describe("handoff gate repair and outcomes", () => {
     expect(projectHandoffEvidence(gate, { terminalId: launched.terminalId, agentName: launched.agentName, agentKind: launched.agentKind, agentSession: { source: "other", agent: "pi", kind: "session", value: "foreign" } }))
       .toEqual({ gated: false, reason: "no_managed_run" });
     expect(projectHandoffEvidence(gate, launched)).toMatchObject({ gated: true, runId: run.runId, path: run.artifactPath, state: "awaiting_handoff" });
+  });
+});
+
+describe("handoff gate: acceptance anchor and trace history (ADR-040 amendment)", () => {
+  const T1 = Date.parse("2026-10-01T12:00:00.000Z");
+  const history = { kind: "pi-jsonl" as const, session: { ...launched.agentSession }, position: { path: "/pi/session.jsonl", offset: 2048, anchor: "e".repeat(64) } };
+
+  async function gated(deps: HandoffGateDeps, identity = runIdentityWithLineage): Promise<{ run: HandoffRun; gate: ReturnType<typeof createHandoffGate>; lines: string[] }> {
+    const dir = await mkdtemp(join(tmpdir(), "herdr-handoff-gate-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, identity);
+    const lines: string[] = [];
+    const gate = createHandoffGate({ ...deps, log: (line) => lines.push(line) });
+    const run = await gate.bind(allocation, launched, { stateChangeSeq: 3, revision: 1 });
+    return { run, gate, lines };
+  }
+
+  async function pinned(run: HandoffRun, atMs: number, summary?: string): Promise<void> {
+    await artifact(run, "done", summary);
+    await utimes(run.artifactPath, new Date(atMs), new Date(atMs));
+  }
+
+  it("persists the anchor and the captured fingerprint when the sha256 is new, awaiting the capture before the mutation", async () => {
+    const captures: Array<{ identity: HandoffBoundIdentity; workspace: unknown; aborted: boolean }> = [];
+    const { run, gate } = await gated({
+      traceHistory: async (identity, workspace, signal) => {
+        captures.push({ identity, workspace, aborted: signal.aborted });
+        return history;
+      },
+    });
+    await pinned(run, T1);
+    expect(await gate.validate(run)).toMatchObject({ state: "accepted" });
+    const state = await readHandoffState(run.allocation);
+    expect(state.artifact).toMatchObject({ version: 1, mtimeMs: Math.floor((await stat(run.artifactPath)).mtimeMs), traceHistory: history });
+    expect(state.artifact.mtimeMs).toBe(T1);
+    expect(captures).toEqual([{ identity: run.identity, workspace: { resolvedCwd: "/repo", worktree: "/repo/.herdr/worktrees/worker" }, aborted: false }]);
+
+    // Byte-identical rewrite with a newer file mtime: still current, the
+    // anchor and fingerprint stay at the FIRST observation, no re-capture.
+    await pinned(run, T1 + 60_000);
+    expect(await gate.validate(run)).toMatchObject({ state: "accepted", artifact: { version: 1 } });
+    expect((await readHandoffState(run.allocation)).artifact).toMatchObject({ version: 1, mtimeMs: T1, traceHistory: history });
+    expect(captures).toHaveLength(1);
+
+    // Acceptance leaves the artifact record untouched.
+    await gate.recordOutcome(run, "handed_off", "accepted");
+    expect((await readHandoffState(run.allocation)).artifact).toMatchObject({ version: 1, mtimeMs: T1, traceHistory: history });
+
+    // A newer artifact advances the anchor and re-captures.
+    gate.beginCycle(run);
+    await pinned(run, T1 + 120_000, "Answered the follow-up.");
+    expect(await gate.validate(run)).toMatchObject({ state: "accepted", artifact: { version: 2 } });
+    expect((await readHandoffState(run.allocation)).artifact).toMatchObject({ version: 2, mtimeMs: T1 + 120_000 });
+    expect(captures).toHaveLength(2);
+  });
+
+  it("a capture that returns undefined or throws persists the anchor without a fingerprint and journals once per run", async () => {
+    let mode: "undefined" | "throw" = "undefined";
+    const { run, gate, lines } = await gated({
+      traceHistory: async () => {
+        if (mode === "throw") throw Object.assign(new Error("boom"), { code: "ENOENT" });
+        return undefined;
+      },
+    });
+    await pinned(run, T1);
+    expect(await gate.validate(run)).toMatchObject({ state: "accepted" });
+    let state = await readHandoffState(run.allocation);
+    expect(state.artifact.mtimeMs).toBe(T1);
+    expect(state.artifact).not.toHaveProperty("traceHistory");
+    expect(lines).toEqual([`herdr-tools handoff_trace_history run=${run.runId} decision=capture_failed reason=capture_undefined`]);
+
+    mode = "throw";
+    gate.beginCycle(run);
+    await pinned(run, T1 + 1_000, "Second artifact.");
+    expect(await gate.validate(run)).toMatchObject({ state: "accepted", artifact: { version: 2 } });
+    state = await readHandoffState(run.allocation);
+    expect(state.artifact.mtimeMs).toBe(T1 + 1_000);
+    expect(state.artifact).not.toHaveProperty("traceHistory");
+    expect(lines).toHaveLength(1);
+
+    // A thrown capture on a fresh run journals its bounded code.
+    const second = await gated({ traceHistory: async () => { throw Object.assign(new Error("boom"), { code: "ENOENT" }); } });
+    await pinned(second.run, T1);
+    await second.gate.validate(second.run);
+    expect(second.lines).toEqual([`herdr-tools handoff_trace_history run=${second.run.runId} decision=capture_failed reason=capture_threw:ENOENT`]);
+    const third = await gated({ traceHistory: async () => { throw new Error("no code"); } });
+    await pinned(third.run, T1);
+    await third.gate.validate(third.run);
+    expect(third.lines[0]).toContain("reason=capture_threw");
+    expect(third.lines[0]).not.toContain("no code");
+  });
+
+  it("without a capture seam the gate persists the anchor alone and journals nothing", async () => {
+    const { run, gate, lines } = await gated({}, runIdentity);
+    await pinned(run, T1);
+    await gate.validate(run);
+    const state = await readHandoffState(run.allocation);
+    expect(state.artifact.mtimeMs).toBe(T1);
+    expect(state.artifact).not.toHaveProperty("traceHistory");
+    expect(lines).toEqual([]);
   });
 });

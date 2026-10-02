@@ -17,9 +17,10 @@
  */
 
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { appendFile, chmod, mkdir, mkdtemp, rm, stat, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { tokenValue } from "../../src/agent-identity.js";
 import type { CliTextResult, JsonEnvelope } from "../../src/cli.js";
@@ -36,11 +37,16 @@ import {
   type HandoffProvenanceInput,
   type HandoffRunIdentity,
   type HandoffTaskContract,
+  type HandoffTraceHistory,
 } from "../../src/handoff.js";
 import type { JobRegistry } from "../../src/job-registry.js";
+import { devinComposerReadArgv } from "../../src/messages/devin-queue-flush.js";
 import type { AgentSessionIdentity } from "../../src/messages/prompt.js";
-import { acquireFlockHolder, type PaneWriteGuard } from "../../src/pane-write-lock.js";
+import { createDevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
+import { acquireFlockHolder, createPaneWriteGuard, PaneWriteLockError, type PaneWriteGuard } from "../../src/pane-write-lock.js";
 import { createSelfCloseTracker } from "../../src/supervision/self-close.js";
+import type { TailScanner } from "../../src/supervision/trace-follow-up.js";
+import { captureTraceHistory, tailScan, type TailScan, type TraceTailDeps } from "../../src/supervision/trace-tail.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 import { createIntentStore, managerSessionKey, type IntentStore } from "../../src/daemon/intents.js";
 import { createMailbox, type Mailbox } from "../../src/daemon/mailbox.js";
@@ -66,6 +72,57 @@ const ownerSession: AgentSessionIdentity = { source: "herdr", agent: "pi", kind:
 const ownerKey = managerSessionKey(ownerSession);
 const childSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/child.jsonl" };
 const childKey = managerSessionKey(childSession);
+const CLAUDE_UUID = "00000000-0000-4000-8000-000000000001";
+const claudeSession: AgentSessionIdentity = { source: "herdr:claude", agent: "claude", kind: "id", value: CLAUDE_UUID };
+const devinSession: AgentSessionIdentity = { source: "herdr:devin", agent: "devin", kind: "id", value: "devin-sess-1" };
+const agySession: AgentSessionIdentity = { source: "herdr:agy", agent: "agy", kind: "id", value: "agy-1" };
+type Kind = "pi" | "claude" | "devin" | "agy";
+const SESSIONS: Record<Kind, AgentSessionIdentity> = { pi: childSession, claude: claudeSession, devin: devinSession, agy: agySession };
+const WORKSPACE_CWD = "/project";
+
+/** The deterministic retirement anchor every seeded artifact carries as its file mtime (ADR-040 amendment). */
+const ANCHOR_MS = Date.parse("2026-10-01T12:00:00.000Z");
+const at = (deltaMs: number): string => new Date(ANCHOR_MS + deltaMs).toISOString();
+/** Redacted Pi session entries: no content, synthetic ids. */
+function piEntry(role: "user" | "assistant" | "toolResult", deltaMs: number, over: Record<string, unknown> = {}): Record<string, unknown> {
+  return { type: "message", id: `m${deltaMs}`, timestamp: at(deltaMs), message: { role, content: "redacted", timestamp: ANCHOR_MS + deltaMs }, ...over };
+}
+const PI_QUIET: Record<string, unknown>[] = [
+  { type: "session", version: 1, id: "sess", timestamp: at(-3_600_000), cwd: WORKSPACE_CWD },
+  piEntry("user", -3_000_000),
+  piEntry("assistant", -2_900_000),
+];
+/** Redacted Claude JSONL records: the §2.1 shapes with no bodies. */
+function claudeRecord(type: string, deltaMs: number | undefined, over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type,
+    sessionId: CLAUDE_UUID,
+    cwd: WORKSPACE_CWD,
+    ...(deltaMs === undefined ? {} : { timestamp: at(deltaMs) }),
+    ...(type === "user" || type === "assistant" ? { message: { role: type, content: "redacted" } } : {}),
+    ...over,
+  };
+}
+const CLAUDE_QUIET: Record<string, unknown>[] = [claudeRecord("user", -3_000_000), claudeRecord("assistant", -2_900_000), claudeRecord("file-history-snapshot", undefined)];
+/** A redacted ATIF document for `devinSession`. */
+function devinDoc(steps: Array<{ source: "system" | "user" | "agent"; deltaMs: number }>, sessionId = devinSession.value): Record<string, unknown> {
+  return {
+    schema_version: "ATIF-v1.7",
+    session_id: sessionId,
+    steps: steps.map((step, index) => ({ step_id: index + 1, timestamp: at(step.deltaMs), source: step.source, message: "redacted" })),
+  };
+}
+const DEVIN_QUIET = [{ source: "system" as const, deltaMs: -3_600_000 }, { source: "user" as const, deltaMs: -3_000_000 }, { source: "agent" as const, deltaMs: -2_900_000 }];
+
+/** The verbatim ansi capture of a Devin composer with queued input (test/fixtures/devin-composer-queued.ansi). */
+const REAL_QUEUED = readFileSync(new URL("../fixtures/devin-composer-queued.ansi", import.meta.url), "utf8");
+const RULE = `\x1b[0m\x1b[38;2;68;68;68m${"─".repeat(60)}\x1b[0m`;
+const GRAY = "\x1b[38;2;124;124;124m";
+const RESET = "\x1b[0m";
+/** Minimal rendered Devin composer: rule / `❭` input / rule. */
+const composerView = (input: string): string => `agent output\n${RULE}\n❭ ${input}\n${RULE}\nSWE-2 Max   Context: 9%\n`;
+const COMPOSER_DRAINED = composerView(`${RESET}${GRAY}Guide Devin while it works${RESET}`);
+const COMPOSER_DRAFT = composerView("typed draft");
 const successorSession: AgentSessionIdentity = { source: "herdr", agent: "pi", kind: "pi", value: "successor-session" };
 
 const task: HandoffTaskContract = {
@@ -79,11 +136,11 @@ const task: HandoffTaskContract = {
 const GRACE_MS = 60_000;
 const SCREEN_READ = ["pane", "read", "p-child", "--source", "detection", "--format", "text"];
 
-const identityFields = (agentName: string): HandoffRunIdentity => ({
+const identityFields = (agentName: string, agentKind: Kind = "pi"): HandoffRunIdentity => ({
   manager: { paneId: "p-owner", display: "pi", source: "agent_name" },
   child: {
     agentName,
-    agentKind: "pi",
+    agentKind,
     operatingPointId: "worker-pi",
     specLabel: "worker",
     fallbackCandidates: [],
@@ -115,12 +172,51 @@ function artifactBody(runId: string): string {
   ].join("\n");
 }
 
-/** Seed a bound run, `handed_off` with a digested artifact unless overridden. */
+/** The trace locations the fixture serves: Pi paths under `traceRoot`, Claude under a `home` of `traceRoot`, Devin under `traceRoot/devin`. */
+function traceDepsFor(fx: Fx): TraceTailDeps {
+  return { rootDir: fx.traceRoot, home: fx.traceRoot, devinTranscriptsDir: join(fx.traceRoot, "devin") };
+}
+
+/** Where a kind's native trace lives inside the fixture. */
+function tracePath(fx: Fx, kind: Kind, session: AgentSessionIdentity): string {
+  if (kind === "pi") return join(fx.traceRoot, session.value);
+  if (kind === "claude") return join(fx.traceRoot, ".claude", "projects", WORKSPACE_CWD.replace(/[^a-zA-Z0-9]/g, "-"), `${session.value}.jsonl`);
+  return join(fx.traceRoot, "devin", `${session.value}.json`);
+}
+
+/** Write a kind's native trace: JSONL records (plus an optional unterminated tail) or one ATIF document. */
+async function writeTrace(fx: Fx, kind: Kind, session: AgentSessionIdentity, records: unknown, pendingTail = ""): Promise<string> {
+  const path = tracePath(fx, kind, session);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const body = kind === "devin" ? JSON.stringify(records) : `${(records as unknown[]).map((record) => JSON.stringify(record)).join("\n")}\n${pendingTail}`;
+  await writeFile(path, body, { mode: 0o600 });
+  return path;
+}
+
+/** Append JSONL records (and an optional unterminated tail) to a seeded lane's trace. */
+async function appendTrace(fx: Fx, kind: Kind, session: AgentSessionIdentity, records: unknown[], pendingTail = ""): Promise<void> {
+  await appendFile(tracePath(fx, kind, session), `${records.map((record) => JSON.stringify(record)).join("\n")}${records.length === 0 ? "" : "\n"}${pendingTail}`);
+}
+
+function quietTrace(kind: Kind): unknown {
+  if (kind === "pi") return PI_QUIET;
+  if (kind === "claude") return CLAUDE_QUIET;
+  return devinDoc(DEVIN_QUIET);
+}
+
+/**
+ * Seed a bound run, `handed_off` with a digested artifact unless overridden.
+ * ADR-040 amendment: the artifact's file mtime is pinned to `anchorMs`, the
+ * sidecar carries that anchor, and the history fingerprint is captured from a
+ * written native trace through the real capture function — exactly what the
+ * gate persists at a first validation.
+ */
 async function seedRun(
-  allocator: HandoffAllocator,
+  fx: Fx,
   options: {
     lifecycle?: HandoffLifecycleState;
     session?: AgentSessionIdentity;
+    agentKind?: Kind;
     paneId?: string;
     terminalId?: string;
     task?: HandoffTaskContract;
@@ -129,35 +225,59 @@ async function seedRun(
     digest?: boolean;
     /** A cycle mark on the lifecycle detail. */
     detail?: string;
+    /** The native trace to write (JSONL records or an ATIF document); `false` writes none. */
+    trace?: unknown | false;
+    /** Unterminated bytes left after the last JSONL record. */
+    pendingTail?: string;
+    /** The artifact's pinned file mtime and persisted anchor (default `ANCHOR_MS`); `false` persists no anchor (a legacy lane). */
+    anchor?: number | false;
+    /** `false` persists the anchor without a fingerprint (a failed capture); a record overrides the captured one. */
+    history?: false | HandoffTraceHistory;
+    /** Workspace record; `false` omits it (Claude's path cannot resolve). */
+    workspace?: false;
   } = {},
-): Promise<{ allocation: HandoffAllocation; runId: string }> {
-  const allocation = await allocator.allocate();
+): Promise<{ allocation: HandoffAllocation; runId: string; tracePath: string }> {
+  const kind = options.agentKind ?? "pi";
+  const session = options.session ?? SESSIONS[kind];
+  const allocation = await fx.allocator.allocate();
   const provenance: HandoffProvenanceInput = {
     managerSession: options.owner === undefined ? ownerSession : options.owner,
     task: options.task ?? task,
   };
-  await allocator.persist(allocation, identityFields("worker"), options.provenance === false ? undefined : provenance);
+  const identity = identityFields("worker", kind);
+  if (options.workspace === false) delete identity.child.workspace;
+  await fx.allocator.persist(allocation, identity, options.provenance === false ? undefined : provenance);
   await updateHandoffState(allocation, (state) => {
     state.child.paneId = options.paneId ?? "p-child";
     state.child.terminalId = options.terminalId ?? "t1";
     state.child.agentId = "agent-1";
-    state.nativeSession = { ...(options.session ?? childSession) };
+    state.nativeSession = { ...session };
     state.lifecycle.watermark = { stateChangeSeq: 4, revision: 2 };
     state.lifecycle.state = options.lifecycle ?? "handed_off";
     if (options.detail !== undefined) state.lifecycle.detail = options.detail;
   });
+  const path = tracePath(fx, kind, session);
+  if (options.trace !== false && kind !== "agy") await writeTrace(fx, kind, session, options.trace ?? quietTrace(kind), options.pendingTail);
   const content = artifactBody(allocation.runId);
   await writeFile(allocation.artifactPath, content, { mode: 0o600 });
+  const anchorMs = options.anchor === false ? ANCHOR_MS : options.anchor ?? ANCHOR_MS;
+  await utimes(allocation.artifactPath, new Date(anchorMs), new Date(anchorMs));
   if (options.digest !== false) {
     const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+    const mtimeMs = Math.floor((await stat(allocation.artifactPath)).mtimeMs);
+    const history = options.history === false || options.anchor === false
+      ? undefined
+      : options.history ?? await captureTraceHistory({ agentKind: kind, agentSession: session }, { resolvedCwd: WORKSPACE_CWD }, new AbortController().signal, traceDepsFor(fx));
     await updateHandoffState(allocation, (state) => {
       state.artifact.sha256 = sha256;
       state.artifact.bytes = Buffer.byteLength(content);
       state.artifact.version = 1;
       state.artifact.status = "done";
+      if (options.anchor !== false) state.artifact.mtimeMs = mtimeMs;
+      if (history !== undefined) state.artifact.traceHistory = history;
     });
   }
-  return { allocation, runId: allocation.runId };
+  return { allocation, runId: allocation.runId, tracePath: path };
 }
 
 /** Rewrite a run's provenance as v2 with `current` as the open owner entry. */
@@ -220,11 +340,12 @@ function ownerAgent(over: RawRecord = {}): RawRecord {
   return { pane_id: "p-owner", name: "manager", agent: "pi", agent_session: { ...ownerSession }, agent_status: "idle", revision: 1, ...over };
 }
 
-/** The live child records the sweep observes; empty `pane` means it is gone. `screen` is the detection-screen text. */
+/** The live child records the sweep observes; empty `pane` means it is gone. `screen` is the detection-screen text, `ansi` the visible ansi frame. */
 interface Live {
   pane?: RawRecord;
   agent?: RawRecord;
   screen?: string;
+  ansi?: string;
 }
 
 /** Two tabs in one workspace: the lane's own tab cascades, the owner's survives. `omitOwner` drops the owner records entirely. */
@@ -265,6 +386,8 @@ interface FakeCliOptions {
   readTruncated?: boolean;
   /** Runs inside the `pane close` dispatch, before the records clear. */
   onClose?: () => Promise<void>;
+  /** Runs after every detection-screen read is served. */
+  onRead?: () => Promise<void>;
 }
 
 /**
@@ -306,6 +429,8 @@ function fakeCli(live: Live, opts: FakeCliOptions = {}): FakeCli {
       if (argv[0] !== "pane" || argv[1] !== "read") throw Object.assign(new Error(`unexpected argv: ${argv.join(" ")}`), { code: "CLI_PROTOCOL_ERROR" });
       if (opts.readError !== undefined) throw opts.readError;
       if (live.pane === undefined) throw Object.assign(new Error("pane gone"), { code: "TARGET_NOT_FOUND" });
+      if (argv.includes("ansi")) return { value: live.ansi ?? COMPOSER_DRAINED, truncated: opts.readTruncated === true };
+      await opts.onRead?.();
       return { value: live.screen ?? "worker> waiting for input", truncated: opts.readTruncated === true };
     },
   };
@@ -354,6 +479,8 @@ interface Fx {
   intents: IntentStore;
   mailbox: Mailbox;
   lines: string[];
+  /** The native traces' root: Pi paths resolve beneath it, it is Claude's `home`, and `devin/` holds ATIF documents. */
+  traceRoot: string;
 }
 
 async function fixture(): Promise<Fx> {
@@ -361,12 +488,14 @@ async function fixture(): Promise<Fx> {
   dirs.push(root);
   const handoffNs: HandoffNamespace = { dir: join(root, "herdr-handoffs"), endpoint: join(root, "herdr.sock") };
   const daemonNs: DaemonNamespace = { dir: join(root, "herdr-tools-daemon"), endpoint: join(root, "daemon.sock") };
+  const traceRoot = join(root, "traces");
   await mkdir(handoffNs.dir, { recursive: true, mode: 0o700 });
   await mkdir(daemonNs.dir, { recursive: true, mode: 0o700 });
+  await mkdir(traceRoot, { recursive: true, mode: 0o700 });
   const allocator = createHandoffAllocator({ namespace: handoffNs });
   const intents = createIntentStore({ namespace: daemonNs });
   const mailbox = createMailbox({ namespace: daemonNs, ownership: daemonRunOwnership(allocator) });
-  return { handoffNs, daemonNs, allocator, intents, mailbox, lines: [] };
+  return { handoffNs, daemonNs, allocator, intents, mailbox, lines: [], traceRoot };
 }
 
 function retirerDeps(
@@ -391,9 +520,29 @@ function retirerDeps(
       options: { enabled: true, graceMs: GRACE_MS, paneLock: fakePaneLock().guard, ...optionOverrides },
       now: () => new Date(clock.nowMs),
       log: (line) => fx.lines.push(line),
+      trace: { trace: traceDepsFor(fx) },
       ...depsOverrides,
     },
   };
+}
+
+/** A tail scanner that counts its calls and delegates to the real one. */
+function countingScan(): { scan: TailScanner; calls: number[] } {
+  const calls: number[] = [];
+  return {
+    calls,
+    scan: async (target, anchorMs, history, deps) => {
+      calls.push(anchorMs);
+      return tailScan(target, anchorMs, history, deps);
+    },
+  };
+}
+
+/** The live records for a child of `kind` — the Pi defaults with the kind's session and agent name substituted. */
+function liveFor(kind: Kind): Live {
+  const session = SESSIONS[kind];
+  const over = { agent: kind, agent_session: { ...session }, tokens: childTokens(session) };
+  return { pane: childPane(over), agent: childAgent(over) };
 }
 
 const closes = (deps: LaneRetirerDeps): string[][] => (deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close");
@@ -434,7 +583,7 @@ async function sweepPastGrace(retirer: { sweep(): Promise<void> }, clock: { nowM
 describe("lane retirer (ADR-040)", () => {
   it("closes a stable handed_off lane under the lock, confirms self-close, and writes exactly one lane_retired", async () => {
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
@@ -474,7 +623,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("reports the live supervisor's jobId and lands the event in a transferred run's successor mailbox", async () => {
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     await transferTo(allocation, successorSession);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, {
@@ -493,7 +642,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("F14: the retired marker and the live supervisor jobId exist before the self-close waiter resolves", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const selfClose = createSelfCloseTracker();
     // The supervisor settles the instant its pending claim resolves — the
@@ -532,10 +681,10 @@ describe("lane retirer (ADR-040)", () => {
   it("refuses a handed_off run marked provider_limit or cycle_reopened, in the sweep and under the lock", async () => {
     const fx = await fixture();
     // The current cycle stalled on a typed provider limit: the manager decides.
-    const limited = await seedRun(fx.allocator, { detail: "provider_limit" });
+    const limited = await seedRun(fx, { detail: "provider_limit" });
     // A follow-up cycle reopened the run after the acceptance: the accepted
     // artifact no longer describes the lane until a fresh acceptance clears it.
-    const reopened = await seedRun(fx.allocator, { detail: "cycle_reopened", paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
+    const reopened = await seedRun(fx, { detail: "cycle_reopened", paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const second: Live = {
       pane: childPane({ pane_id: "p-child-2", terminal_id: "t2", agent_session: { ...childSession, value: "/pi/child-2.jsonl" }, tokens: childTokens({ ...childSession, value: "/pi/child-2.jsonl" }) }),
@@ -558,7 +707,7 @@ describe("lane retirer (ADR-040)", () => {
     expect(retirer.view(limited.runId)).toMatchObject({ state: "retired" });
 
     // The under-lock re-read refuses a mark that lands in the lock window.
-    const late = await seedRun(fx.allocator, { paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
+    const late = await seedRun(fx, { paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
     await updateHandoffState(reopened.allocation, (state) => { state.lifecycle.state = "cancelled"; });
     const lock = fakePaneLock({ onAcquire: async () => { await updateHandoffState(late.allocation, (state) => { state.lifecycle.detail = "cycle_reopened"; }); } });
     const lateDeps = retirerDeps(fx, second, { options: { paneLock: lock.guard } });
@@ -571,7 +720,7 @@ describe("lane retirer (ADR-040)", () => {
   it("never retires a run whose lifecycle is not handed_off", async () => {
     const fx = await fixture();
     for (const lifecycle of ["awaiting_handoff", "recovery_pending", "cancelled", "failed"] as const) {
-      const { runId } = await seedRun(fx.allocator, { lifecycle });
+      const { runId } = await seedRun(fx, { lifecycle });
       const live: Live = { pane: childPane(), agent: childAgent() };
       const { deps, clock } = retirerDeps(fx, live);
       const retirer = createLaneRetirer(deps);
@@ -585,7 +734,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("refuses a run whose sidecar is missing or malformed", async () => {
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     await writeFile(allocation.statePath, "{not json", { mode: 0o600 });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
@@ -600,12 +749,12 @@ describe("lane retirer (ADR-040)", () => {
 
   it("refuses an unbound child identity and an unusable session key", async () => {
     const fx = await fixture();
-    const unbound = await seedRun(fx.allocator);
+    const unbound = await seedRun(fx);
     await updateHandoffState(unbound.allocation, (state) => {
       state.child.terminalId = null;
       state.nativeSession = null;
     });
-    const malformed = await seedRun(fx.allocator);
+    const malformed = await seedRun(fx);
     await updateHandoffState(malformed.allocation, (state) => {
       state.nativeSession = { source: "herdr:pi", agent: "pi", kind: "path", value: "bad\nvalue" };
     });
@@ -620,8 +769,8 @@ describe("lane retirer (ADR-040)", () => {
 
   it("skips a provably absent child and defers an ambiguous one", async () => {
     const fx = await fixture();
-    const absent = await seedRun(fx.allocator, { paneId: "p-absent", terminalId: "t-absent" });
-    const ambiguous = await seedRun(fx.allocator);
+    const absent = await seedRun(fx, { paneId: "p-absent", terminalId: "t-absent" });
+    const ambiguous = await seedRun(fx);
     const live: Live = {};
     const { deps, clock } = retirerDeps(fx, live, {
       snapshot: async () => snapshotFor(live, {
@@ -640,7 +789,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("journals a skipped child_absent once per decision change, not once per sweep", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = {};
     const { deps } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
@@ -669,7 +818,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("resets the stability clock on seq changes and on working status", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
@@ -704,7 +853,7 @@ describe("lane retirer (ADR-040)", () => {
   it("defers while the agent record carries no usable state_change_seq or status, and reads the agent's counter when only the pane lacks one", async () => {
     // Both records lack the counter.
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const pane = childPane();
     const agent = childAgent();
     delete pane.state_change_seq;
@@ -718,7 +867,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // F2/F12: the pane's counter never stands in for a missing agent counter.
     const fx2 = await fixture();
-    const paneOnly = await seedRun(fx2.allocator);
+    const paneOnly = await seedRun(fx2);
     const agentNoSeq = childAgent();
     delete agentNoSeq.state_change_seq;
     live = { pane: childPane(), agent: agentNoSeq };
@@ -730,7 +879,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // F2/F12: nor does the pane's status stand in for a missing agent status.
     const fx3 = await fixture();
-    const noStatus = await seedRun(fx3.allocator);
+    const noStatus = await seedRun(fx3);
     const agentNoStatus = childAgent();
     delete agentNoStatus.agent_status;
     live = { pane: childPane(), agent: agentNoStatus };
@@ -743,7 +892,7 @@ describe("lane retirer (ADR-040)", () => {
     // The agent record is the authority: a pane without a counter is fine
     // while the agent record carries one.
     const fx4 = await fixture();
-    const agentOnly = await seedRun(fx4.allocator);
+    const agentOnly = await seedRun(fx4);
     const paneNoSeq = childPane();
     delete paneNoSeq.state_change_seq;
     live = { pane: paneNoSeq, agent: childAgent() };
@@ -764,7 +913,7 @@ describe("lane retirer (ADR-040)", () => {
     ];
     for (const entry of cases) {
       const fx = await fixture();
-      const { runId } = await seedRun(fx.allocator);
+      const { runId } = await seedRun(fx);
       const live: Live = { pane: childPane(), agent: entry.agent };
       const { deps, clock } = retirerDeps(fx, live);
       const retirer = createLaneRetirer(deps);
@@ -797,7 +946,7 @@ describe("lane retirer (ADR-040)", () => {
     ];
     for (const entry of cases) {
       const fx = await fixture();
-      const { runId } = await seedRun(fx.allocator);
+      const { runId } = await seedRun(fx);
       const live: Live = { pane: childPane(), agent: childAgent() };
       const { deps, clock } = retirerDeps(fx, live, {
         cli: fakeCli(live, { ...(entry.getPane === undefined ? {} : { getPane: entry.getPane }), ...(entry.getAgent === undefined ? {} : { getAgent: entry.getAgent }) }),
@@ -817,7 +966,7 @@ describe("lane retirer (ADR-040)", () => {
     // A screen change inside the grace restarts the observation even though
     // status and seq never moved — the stale-telemetry case.
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent(), screen: "worker> done" };
     let { deps, clock } = retirerDeps(fx, live);
     let retirer = createLaneRetirer(deps);
@@ -835,7 +984,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // An unreadable screen is no proof: defer and hold the clock.
     const fx2 = await fixture();
-    const unreadable = await seedRun(fx2.allocator);
+    const unreadable = await seedRun(fx2);
     const live2: Live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live2, { cli: fakeCli(live2, { readError: Object.assign(new Error("read failed"), { code: "CLI_PROTOCOL_ERROR" }) }) }));
     retirer = createLaneRetirer(deps);
@@ -845,7 +994,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A truncated screen was not fully observed — it cannot count as unchanged.
     const fx3 = await fixture();
-    const truncated = await seedRun(fx3.allocator);
+    const truncated = await seedRun(fx3);
     const live3: Live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx3, live3, { cli: fakeCli(live3, { readTruncated: true }) }));
     retirer = createLaneRetirer(deps);
@@ -857,7 +1006,7 @@ describe("lane retirer (ADR-040)", () => {
   it("F1/F8: the screen digest is re-read under the lock — a change or an unreadable screen defers and restarts the clock", async () => {
     // The screen changes inside the lock window: the proof is void.
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent(), screen: "worker> done" };
     const lock = fakePaneLock({ onAcquire: async () => { live.screen = "worker> one more thing"; } });
     let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
@@ -872,7 +1021,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // The under-lock read fails: defer, never dispatch.
     const fx2 = await fixture();
-    const unreadable = await seedRun(fx2.allocator);
+    const unreadable = await seedRun(fx2);
     const live2: Live = { pane: childPane(), agent: childAgent() };
     const cliOpts: FakeCliOptions = {};
     const lock2 = fakePaneLock({ onAcquire: async () => { cliOpts.readError = Object.assign(new Error("read failed"), { code: "CLI_PROTOCOL_ERROR" }); } });
@@ -925,7 +1074,7 @@ describe("lane retirer (ADR-040)", () => {
       },
     ];
     for (const entry of cases) {
-      const { runId } = await seedRun(fx.allocator);
+      const { runId } = await seedRun(fx);
       const live: Live = { pane: entry.pane, agent: entry.agent };
       const { deps, clock } = retirerDeps(fx, live);
       const retirer = createLaneRetirer(deps);
@@ -937,7 +1086,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("keeps a lane whose task retention or pane token says keep", async () => {
     const fx = await fixture();
-    const keptByTask = await seedRun(fx.allocator, { task: { ...task, retention: "keep" } });
+    const keptByTask = await seedRun(fx, { task: { ...task, retention: "keep" } });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
@@ -951,7 +1100,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // The cooperative fallback: a `retention=keep` pane token parks the lane.
     const fx2 = await fixture();
-    const keptByToken = await seedRun(fx2.allocator);
+    const keptByToken = await seedRun(fx2);
     const live2: Live = {
       pane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
       agent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
@@ -964,8 +1113,8 @@ describe("lane retirer (ADR-040)", () => {
 
   it("F15: clearing the retention pane token releases a token-kept lane, while a task-field keep stays kept", async () => {
     const fx = await fixture();
-    const keptByTask = await seedRun(fx.allocator, { task: { ...task, retention: "keep" } });
-    const keptByToken = await seedRun(fx.allocator);
+    const keptByTask = await seedRun(fx, { task: { ...task, retention: "keep" } });
+    const keptByToken = await seedRun(fx);
     const live: Live = {
       pane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
       agent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
@@ -998,7 +1147,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("F16: a token-kept lane accrues no grace across kept sweeps — clearing keep starts a full window", async () => {
     const fx = await fixture();
-    const kept = await seedRun(fx.allocator);
+    const kept = await seedRun(fx);
     const live: Live = {
       pane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
       agent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
@@ -1028,7 +1177,7 @@ describe("lane retirer (ADR-040)", () => {
   it("F4: an unreadable provenance never overrides a keep opt-out — only a genuinely missing record is legacy", async () => {
     // Malformed provenance on a kept lane: refuse, never fall back to retire.
     const fx = await fixture();
-    const kept = await seedRun(fx.allocator, { task: { ...task, retention: "keep" } });
+    const kept = await seedRun(fx, { task: { ...task, retention: "keep" } });
     await writeFile(join(kept.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 });
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live);
@@ -1042,7 +1191,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // An untrusted (group/world-writable) record refuses the same way.
     const fx2 = await fixture();
-    const untrusted = await seedRun(fx2.allocator, { task: { ...task, retention: "keep" } });
+    const untrusted = await seedRun(fx2, { task: { ...task, retention: "keep" } });
     await chmod(join(untrusted.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), 0o666);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
@@ -1054,7 +1203,7 @@ describe("lane retirer (ADR-040)", () => {
     // A transferred run whose record became unreadable refuses rather than
     // protecting the original manager pane in the current owner's place.
     const fx3 = await fixture();
-    const transferred = await seedRun(fx3.allocator);
+    const transferred = await seedRun(fx3);
     await transferTo(transferred.allocation, successorSession);
     await writeFile(join(transferred.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 });
     live = { pane: childPane(), agent: childAgent() };
@@ -1067,7 +1216,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("refuses a pane other records name as their manager", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, {
       snapshot: async () => snapshotFor(live, {
@@ -1084,7 +1233,7 @@ describe("lane retirer (ADR-040)", () => {
   it("refuses a caller-policy failure and an open — effecting or merely recorded — intent ledger under the child's session", async () => {
     // Malformed scope evidence makes classification itself refuse.
     const fx = await fixture();
-    const policyRun = await seedRun(fx.allocator);
+    const policyRun = await seedRun(fx);
     let live: Live = {
       pane: childPane({ tokens: childTokens(childSession, { identity_scope: { bad: true } }) }),
       agent: childAgent(),
@@ -1096,7 +1245,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // An `effecting` intent under the child's own session key refuses.
     const fx2 = await fixture();
-    const openRun = await seedRun(fx2.allocator);
+    const openRun = await seedRun(fx2);
     const begun = await fx2.intents.begin({
       managerSessionKey: childKey,
       idempotencyKey: "sub-open",
@@ -1114,7 +1263,7 @@ describe("lane retirer (ADR-040)", () => {
     // F5: a `recorded` intent — its launch request may be executing right
     // now, with no child token yet to mark the pane a manager — is open too.
     const fx3 = await fixture();
-    const recordedRun = await seedRun(fx3.allocator);
+    const recordedRun = await seedRun(fx3);
     await recordedChildIntent(fx3.intents, "sub-recorded");
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx3, live));
@@ -1128,7 +1277,7 @@ describe("lane retirer (ADR-040)", () => {
   it("refuses a sub-manager with unproven or nonterminal recorded children, then retires once they settle", async () => {
     // A child runId with no readable sidecar is unproven — refuse.
     const fx = await fixture();
-    const unproven = await seedRun(fx.allocator);
+    const unproven = await seedRun(fx);
     await recordChildIntent(fx.intents, "sub-ghost", [{ name: "ghost", runId: "11111111-2222-4333-8444-555555555555" }]);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live);
@@ -1138,8 +1287,8 @@ describe("lane retirer (ADR-040)", () => {
 
     // A recorded child whose sidecar is not yet terminal refuses the same way.
     const fx2 = await fixture();
-    const managed = await seedRun(fx2.allocator);
-    const liveChild = await seedRun(fx2.allocator, { lifecycle: "awaiting_handoff", paneId: "p-sub", terminalId: "t-sub" });
+    const managed = await seedRun(fx2);
+    const liveChild = await seedRun(fx2, { lifecycle: "awaiting_handoff", paneId: "p-sub", terminalId: "t-sub" });
     await recordChildIntent(fx2.intents, "sub-live", [{ name: "sub", runId: liveChild.runId }, { name: "alias" }]);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
@@ -1160,7 +1309,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("refuses while the child's own mailbox holds unread events", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     await fx.mailbox.writeGapEvent(childKey, { from: "2026-10-01T00:00:00.000Z", to: "2026-10-01T01:00:00.000Z", lost: {} });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
@@ -1172,7 +1321,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("F13: reads the child's own ledger directly — the manager enumeration is never consulted — and defers when the ledger or the mailbox cannot be read", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
 
     // A broken manager enumeration is irrelevant: only the child's ledger is read.
@@ -1190,7 +1339,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // The child's own ledger read fails — defer.
     const fx2 = await fixture();
-    const ledgerRun = await seedRun(fx2.allocator);
+    const ledgerRun = await seedRun(fx2);
     const brokenLedger: IntentStore = {
       ...fx2.intents,
       list: async (key) => (key === childKey ? Promise.reject(Object.assign(new Error("io"), { code: "INTENT_STORE_UNAVAILABLE" })) : fx2.intents.list(key)),
@@ -1217,7 +1366,7 @@ describe("lane retirer (ADR-040)", () => {
   it("refuses when the owner's pane sits inside the cascade and defers on invalid topology", async () => {
     // The recorded current owner IS the child pane — the cascade always reaches it.
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     await transferTo(allocation, childSession);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live);
@@ -1228,7 +1377,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A dangling parent — the child's tab has no record — is malformed topology.
     const fx2 = await fixture();
-    const dangling = await seedRun(fx2.allocator);
+    const dangling = await seedRun(fx2);
     live = { pane: childPane({ tab_id: "tab-ghost" }), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
     retirer = createLaneRetirer(deps);
@@ -1238,7 +1387,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("retires with no provenance record by falling back to the launch manager pane", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator, { provenance: false });
+    const { runId } = await seedRun(fx, { provenance: false });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
@@ -1248,7 +1397,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("defers a focused pane only for the bounded count, then retires", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane({ focused: true }), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, { options: { maxFocusDefers: 2 } });
     const retirer = createLaneRetirer(deps);
@@ -1267,7 +1416,7 @@ describe("lane retirer (ADR-040)", () => {
   it("defers at close time when the under-lock pane is focused, drifted, or busy", async () => {
     // The snapshot records an unfocused idle pane; `pane get` reveals focused.
     const fx = await fixture();
-    const focused = await seedRun(fx.allocator);
+    const focused = await seedRun(fx);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live, { cli: fakeCli(live, { getPane: childPane({ focused: true }) }) });
     let retirer = createLaneRetirer(deps);
@@ -1277,7 +1426,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A session that drifted between the snapshot and the lock refuses the close.
     const fx2 = await fixture();
-    const drifted = await seedRun(fx2.allocator);
+    const drifted = await seedRun(fx2);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live, {
       cli: fakeCli(live, { getAgent: childAgent({ agent_session: { ...childSession, value: "/pi/other.jsonl" } }) }),
@@ -1288,8 +1437,8 @@ describe("lane retirer (ADR-040)", () => {
 
     // A coherent working tuple under the lock defers without spending an attempt.
     const fx3 = await fixture();
-    const busy = await seedRun(fx3.allocator);
-    const moved = await seedRun(fx3.allocator);
+    const busy = await seedRun(fx3);
+    const moved = await seedRun(fx3);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx3, live, {
       cli: fakeCli(live, { getPane: childPane({ agent_status: "working", state_change_seq: 9 }), getAgent: childAgent({ agent_status: "working", state_change_seq: 9 }) }),
@@ -1304,7 +1453,7 @@ describe("lane retirer (ADR-040)", () => {
   it("re-proves the terminal identity and the stability seq under the lock", async () => {
     // Records that join cleanly but name a different terminal fail the field check.
     const fx = await fixture();
-    const moved = await seedRun(fx.allocator);
+    const moved = await seedRun(fx);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live, {
       cli: fakeCli(live, { getPane: childPane({ terminal_id: "t2" }), getAgent: childAgent({ terminal_id: "t2" }) }),
@@ -1316,7 +1465,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A coherent seq bump observed only under the lock restarts the stability clock.
     const fx2 = await fixture();
-    const { runId } = await seedRun(fx2.allocator);
+    const { runId } = await seedRun(fx2);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live, {
       cli: fakeCli(live, { getPane: childPane({ state_change_seq: 9 }), getAgent: childAgent({ state_change_seq: 9 }) }),
@@ -1332,7 +1481,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("defers when the under-lock records drop the launch tokens", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, {
       cli: fakeCli(live, {
@@ -1348,7 +1497,7 @@ describe("lane retirer (ADR-040)", () => {
     // The provenance token survives but the session token is gone — the
     // second under-lock token gate refuses the same way.
     const fx2 = await fixture();
-    const dropped = await seedRun(fx2.allocator);
+    const dropped = await seedRun(fx2);
     const live2: Live = { pane: childPane(), agent: childAgent() };
     const deps2 = retirerDeps(fx2, live2, {
       cli: fakeCli(live2, {
@@ -1366,7 +1515,7 @@ describe("lane retirer (ADR-040)", () => {
     // lock: the fresh provenance makes the child the current owner, and the
     // topology re-validation refuses exactly as a pre-sweep transfer would.
     const fx = await fixture();
-    const transferred = await seedRun(fx.allocator);
+    const transferred = await seedRun(fx);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let lock = fakePaneLock({ onAcquire: () => transferTo(transferred.allocation, childSession) });
     let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
@@ -1378,7 +1527,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // An event landing in the child's mailbox inside the window refuses.
     const fx2 = await fixture();
-    const mailed = await seedRun(fx2.allocator);
+    const mailed = await seedRun(fx2);
     live = { pane: childPane(), agent: childAgent() };
     lock = fakePaneLock({ onAcquire: async () => { await fx2.mailbox.writeGapEvent(childKey, { from: "2026-10-01T00:00:00.000Z", to: "2026-10-01T01:00:00.000Z", lost: {} }); } });
     ({ deps, clock } = retirerDeps(fx2, live, { options: { paneLock: lock.guard } }));
@@ -1390,7 +1539,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A launch intent recorded under the child's key inside the window refuses.
     const fx3 = await fixture();
-    const launching = await seedRun(fx3.allocator);
+    const launching = await seedRun(fx3);
     live = { pane: childPane(), agent: childAgent() };
     lock = fakePaneLock({ onAcquire: () => recordedChildIntent(fx3.intents, "sub-late") });
     ({ deps, clock } = retirerDeps(fx3, live, { options: { paneLock: lock.guard } }));
@@ -1405,7 +1554,7 @@ describe("lane retirer (ADR-040)", () => {
     // The close dispatch runs while the run's native flock is held: a
     // concurrent transfer (which takes the same flock) cannot interleave.
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const probe = async (): Promise<boolean> => {
       try {
@@ -1430,7 +1579,7 @@ describe("lane retirer (ADR-040)", () => {
     // An unacquirable run flock defers before any under-lock read and spends
     // no attempt: the first real close failure afterwards is still a retry.
     const fx2 = await fixture();
-    const contended = await seedRun(fx2.allocator);
+    const contended = await seedRun(fx2);
     const live2: Live = { pane: childPane(), agent: childAgent() };
     const real = daemonRunOwnership(fx2.allocator);
     const gate = { fail: true };
@@ -1452,7 +1601,7 @@ describe("lane retirer (ADR-040)", () => {
     // A release fault after the section ran cannot recall a proven close:
     // the recorded outcome stands and the event is written.
     const fx3 = await fixture();
-    const faulting = await seedRun(fx3.allocator);
+    const faulting = await seedRun(fx3);
     const live3: Live = { pane: childPane(), agent: childAgent() };
     const real3 = daemonRunOwnership(fx3.allocator);
     const leaky: LaneRetirerDeps["ownership"] = {
@@ -1472,7 +1621,7 @@ describe("lane retirer (ADR-040)", () => {
   it("F3: re-reads the sidecar and the provenance under the locks — a released or unreadable run, an unreadable record, or a late keep never closes", async () => {
     // The run left `handed_off` inside the window.
     const fx = await fixture();
-    const released = await seedRun(fx.allocator);
+    const released = await seedRun(fx);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let lock = fakePaneLock({ onAcquire: async () => { await updateHandoffState(released.allocation, (state) => { state.lifecycle.state = "cancelled"; }); } });
     let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
@@ -1484,7 +1633,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // The sidecar became unreadable inside the window.
     const fx2 = await fixture();
-    const broken = await seedRun(fx2.allocator);
+    const broken = await seedRun(fx2);
     live = { pane: childPane(), agent: childAgent() };
     lock = fakePaneLock({ onAcquire: () => writeFile(broken.allocation.statePath, "{not json", { mode: 0o600 }) });
     ({ deps, clock } = retirerDeps(fx2, live, { options: { paneLock: lock.guard } }));
@@ -1495,7 +1644,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // The provenance became unreadable inside the window.
     const fx3 = await fixture();
-    const corrupted = await seedRun(fx3.allocator);
+    const corrupted = await seedRun(fx3);
     live = { pane: childPane(), agent: childAgent() };
     lock = fakePaneLock({ onAcquire: () => writeFile(join(corrupted.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 }) });
     ({ deps, clock } = retirerDeps(fx3, live, { options: { paneLock: lock.guard } }));
@@ -1508,7 +1657,7 @@ describe("lane retirer (ADR-040)", () => {
     // A keep that appears under the lock — in the task contract or as a pane
     // token — parks the lane instead of closing it.
     const fx4 = await fixture();
-    const lateKeep = await seedRun(fx4.allocator);
+    const lateKeep = await seedRun(fx4);
     live = { pane: childPane(), agent: childAgent() };
     lock = fakePaneLock({ onAcquire: async () => {
       const prior = await readHandoffProvenance(lateKeep.allocation);
@@ -1521,7 +1670,7 @@ describe("lane retirer (ADR-040)", () => {
     expect(live.pane).not.toBeUndefined();
 
     const fx5 = await fixture();
-    const tokenKeep = await seedRun(fx5.allocator);
+    const tokenKeep = await seedRun(fx5);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx5, live, {
       cli: fakeCli(live, {
@@ -1537,7 +1686,7 @@ describe("lane retirer (ADR-040)", () => {
 
   it("F7: checks the lease immediately before dispatch — a lost lease defers without spending an attempt", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const lockOpts: FakeLockOptions = { checkError: Object.assign(new Error("holder is not live"), { code: "PANE_WRITE_LOCK_UNAVAILABLE" }) };
     const lock = fakePaneLock(lockOpts);
@@ -1559,204 +1708,21 @@ describe("lane retirer (ADR-040)", () => {
     expect(closes(deps)).toHaveLength(1);
   });
 
-  it("retires a lane whose artifact carries no recorded digest, omitting artifactSha256", async () => {
+  it("ADR-040 amendment: a handed_off lane with no accepted digest never retires — there is no anchor to prove against", async () => {
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator, { digest: false });
+    const { runId } = await seedRun(fx, { digest: false });
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
     await sweepPastGrace(retirer, clock);
-    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
-    const unread = await fx.mailbox.list(ownerKey);
-    expect(unread).toHaveLength(1);
-    const event = await fx.mailbox.read(ownerKey, unread[0]!);
-    expect(event).toMatchObject({
-      kind: "lane_retired",
-      handoff: { state: "handed_off" },
-      actions: ["pane_closed:p-child", `artifact:${allocation.artifactPath}`],
-    });
-    expect((event as { handoff?: Record<string, unknown> }).handoff).not.toHaveProperty("artifactSha256");
-  });
-
-  it("still retires when the pane-lock release rejects", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const { deps, clock } = retirerDeps(fx, live, {
-      options: { paneLock: fakePaneLock({ releaseError: new Error("flock release lost") }).guard },
-    });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
-    expect(live.pane).toBeUndefined();
-    expect(await fx.mailbox.list(ownerKey)).toHaveLength(1);
-  });
-
-  it("retires when the recorded owner's pane is absent from the snapshot", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const { deps, clock } = retirerDeps(fx, live, {
-      snapshot: async () => snapshotFor(live, { omitOwner: true }),
-    });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    // Nothing the close could cascade into — the absent owner protects nothing.
-    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
-    expect(live.pane).toBeUndefined();
-    // The event still routes to the recorded owner mailbox.
-    const unread = await fx.mailbox.list(ownerKey);
-    expect(unread).toHaveLength(1);
-    expect(await fx.mailbox.read(ownerKey, unread[0]!)).toMatchObject({ kind: "lane_retired", runId });
-  });
-
-  it("defers a malformed pane record, bounds journal fragments, and runs on the default clock and sink", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    // A non-string status is malformed lifecycle evidence — a bounded
-    // deferral, never journal text — and with no injected clock or sink the
-    // retirer runs on its defaults.
-    const live: Live = { pane: childPane({ agent_status: 7 }), agent: childAgent() };
-    const { deps } = retirerDeps(fx, live, { now: undefined, log: undefined });
-    const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "lifecycle_target_record_malformed" });
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_anchor_missing" });
     expect(live.pane).not.toBeUndefined();
-
-    // A rejection that is not an error object at all still journals as ERROR.
-    const broken: HandoffAllocator = {
-      ...fx.allocator,
-      open: () => Promise.reject<never>("io lost"),
-    };
-    const { deps: deps2 } = retirerDeps(fx, live, { allocator: broken });
-    const retirer2 = createLaneRetirer(deps2);
-    await retirer2.sweep();
-    expect(retirer2.view(runId)).toMatchObject({ state: "refused", reason: "sidecar_ERROR" });
-
-    // A defect escaping evaluate — an injected clock that throws — is
-    // journaled as a sweep error and never strands the sweep.
-    const { deps: deps3 } = retirerDeps(fx, { pane: childPane(), agent: childAgent() }, {
-      now: () => {
-        throw Object.assign(new Error("clock broke"), { code: "CLOCK_STOPPED" });
-      },
-    });
-    await createLaneRetirer(deps3).sweep();
-    expect(fx.lines.some((line) => line.includes(`run=${runId}`) && line.includes("decision=sweep_error reason=CLOCK_STOPPED"))).toBe(true);
-  });
-
-  it("dry-run journals would_retire and never closes", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const { deps, clock } = retirerDeps(fx, live, { options: { enabled: false } });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "disabled" });
-    expect(live.pane).not.toBeUndefined();
-    // Only the per-sweep screen reads — nothing under a lock, no close.
-    expect(lockedCalls(deps)).toHaveLength(0);
-    expect(fx.lines.filter((line) => line.includes(`run=${runId}`) && line.includes("decision=would_retire"))).toHaveLength(1);
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
-  });
-
-  it("retries an uncertain close on the next sweeps, then marks failed with no event", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const { deps, clock } = retirerDeps(fx, live, {
-      cli: fakeCli(live, { closeError: Object.assign(new Error("socket dropped"), { code: "CLI_UNAVAILABLE" }) }),
-    });
-    const retirer = createLaneRetirer(deps);
-    for (let sweep = 0; sweep < 4; sweep += 1) {
-      clock.nowMs += GRACE_MS;
-      await retirer.sweep();
-    }
-    // Three close attempts — the initial plus two retries — then failed.
-    expect(closes(deps)).toHaveLength(3);
-    expect(retirer.view(runId)).toMatchObject({ state: "failed", reason: "close_MUTATION_UNCERTAIN" });
-    expect(retirer.retiredByDaemon(runId)).toBe(false);
-    expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
-    expect(live.pane).not.toBeUndefined();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(closes(deps)).toHaveLength(3);
-  });
-
-  it("defers without spending attempts when the pane lock cannot be acquired", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const { deps, clock } = retirerDeps(fx, live, { options: { paneLock: fakePaneLock({ fails: true }).guard } });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "pane_lock_unavailable" });
-    expect(lockedCalls(deps)).toHaveLength(0);
-  });
-
-  it("F6/F9: a reconciled absence is another actor's close — no retired marker, no lane_retired, and the next sweep drops the vanished child", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const selfClose = createSelfCloseTracker();
-    // The transport error raced a real close by someone else: the readback
-    // finds the pane gone, but no mutation of ours proved it.
-    const cli = fakeCli(live, {
-      closeError: Object.assign(new Error("socket dropped mid-close"), { code: "CLI_UNAVAILABLE" }),
-      onClose: async () => {
-        live.pane = undefined;
-        live.agent = undefined;
-      },
-    });
-    const { deps, clock } = retirerDeps(fx, live, { cli, selfClose });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "close_reconciled_absent" });
-    // Not this daemon's retirement: JobRegistry must still emit job_terminal.
-    expect(retirer.retiredByDaemon(runId)).toBe(false);
-    // The own-close ledger holds no confirmed marker — the pane_closed wake lands normally.
-    expect(await selfClose.consume("p-child")).toBe(false);
-    expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
-    expect(fx.lines.some((line) => line.includes(`run=${runId}`) && line.includes("decision=deferred reason=close_reconciled_absent"))).toBe(true);
-    // The next sweep observes the absence and stops tracking the run.
-    await retirer.sweep();
-    expect(retirer.view(runId)).toBeUndefined();
-    expect(retirer.retiredByDaemon(runId)).toBe(false);
-    expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
-  });
-
-  it("still retires when the lane_retired event cannot persist, and journals the loss", async () => {
-    const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
-    const live: Live = { pane: childPane(), agent: childAgent() };
-    const refusing: Pick<Mailbox, "writeRunEvent" | "list"> = {
-      writeRunEvent: async () => ({ persisted: false, persistenceFailed: true, eventId: "e", reason: "capacity", at: "2026-10-01T00:00:00.000Z" }),
-      list: async () => [],
-    };
-    const { deps, clock } = retirerDeps(fx, live, { mailbox: refusing });
-    const retirer = createLaneRetirer(deps);
-    await sweepPastGrace(retirer, clock);
-    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
-    expect(retirer.retiredByDaemon(runId)).toBe(true);
-    expect(fx.lines.some((line) => line.includes("decision=retired_event_unpersisted reason=capacity"))).toBe(true);
-
-    const fx2 = await fixture();
-    const thrown = await seedRun(fx2.allocator);
-    const live2: Live = { pane: childPane(), agent: childAgent() };
-    const throwing: Pick<Mailbox, "writeRunEvent" | "list"> = {
-      writeRunEvent: async () => { throw new Error("sink down"); },
-      list: async () => [],
-    };
-    const deps2 = retirerDeps(fx2, live2, { mailbox: throwing });
-    const retirer2 = createLaneRetirer(deps2.deps);
-    await sweepPastGrace(retirer2, deps2.clock);
-    expect(retirer2.view(thrown.runId)).toMatchObject({ state: "retired" });
   });
 
   it("survives a failed snapshot, an absent or unreadable runs dir, and a mid-sweep fault", async () => {
     const fx = await fixture();
-    const { allocation, runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx);
     const live: Live = { pane: childPane(), agent: childAgent() };
 
     // Snapshot failure: no classification is ever inferred.
@@ -1791,5 +1757,405 @@ describe("lane retirer (ADR-040)", () => {
     await rm(join(fx.handoffNs.dir, runId), { recursive: true, force: true });
     await retirer5.sweep();
     expect(retirer5.view(runId)).toBeUndefined();
+  });
+});
+
+/**
+ * The ADR-040 amendment (plan rev4): the supervisor-independent follow-up
+ * proof — persisted artifact-time anchor, native-history fingerprint, bounded
+ * reverse tail scan — and the Devin composer guard, in the sweep and under the
+ * close lock, through the real scan over real trace files unless a row names
+ * the scripted seam (the two budget rows need > 8 MiB sources).
+ */
+describe("lane retirer follow-up proof (ADR-040 amendment)", () => {
+  interface Seeded { allocation: HandoffAllocation; runId: string; tracePath: string }
+  interface Ctx { fx: Fx; seeded: Seeded; live: Live; scripted: { scan?: TailScan } }
+  interface Row {
+    name: string;
+    kind?: Kind;
+    /** The sweep reason; the lock reason is `recheck_` + this. */
+    reason: string;
+    state?: "refused" | "deferred";
+    /** Rows a lock recheck cannot stage (the sweep already refused them). */
+    sweepOnly?: boolean;
+    seed?: Parameters<typeof seedRun>[1];
+    mutate: (ctx: Ctx) => Promise<unknown>;
+  }
+  const noop = async (): Promise<void> => undefined;
+  const sidecar = (ctx: Ctx, mutate: (state: Parameters<Parameters<typeof updateHandoffState>[1]>[0]) => void) => updateHandoffState(ctx.seeded.allocation, mutate);
+  const ROWS: Row[] = [
+    { name: "kind without reader (agy)", kind: "agy", reason: "trace_unsupported_kind", sweepOnly: true, mutate: noop },
+    { name: "legacy lane: no anchor", reason: "trace_anchor_missing", mutate: (ctx) => sidecar(ctx, (state) => { delete state.artifact.mtimeMs; }) },
+    { name: "anchor without a fingerprint (capture failed)", reason: "trace_history_missing", mutate: (ctx) => sidecar(ctx, (state) => { delete state.artifact.traceHistory; }) },
+    { name: "fingerprint for another session", reason: "trace_history_stale", mutate: (ctx) => sidecar(ctx, (state) => { state.artifact.traceHistory!.session = { ...childSession, value: "/pi/other.jsonl" }; }) },
+    {
+      name: "trace shorter than the fingerprint (same-session rollback)",
+      reason: "trace_source_rewritten",
+      mutate: async (ctx) => {
+        const position = (await readHandoffStateOf(ctx)).artifact.traceHistory!.position as { offset: number };
+        await truncate(ctx.seeded.tracePath, position.offset - 1);
+      },
+    },
+    { name: "artifact missing at check time", reason: "trace_artifact_missing", mutate: (ctx) => rm(ctx.seeded.allocation.artifactPath) },
+    { name: "artifact untrusted at check time", reason: "trace_artifact_untrusted", mutate: (ctx) => chmod(ctx.seeded.allocation.artifactPath, 0o666) },
+    { name: "artifact invalid at check time", reason: "trace_artifact_invalid", mutate: (ctx) => writeFile(ctx.seeded.allocation.artifactPath, "garbage\n", { mode: 0o600 }) },
+    { name: "artifact bytes differ from the accepted sha256", reason: "trace_artifact_changed", mutate: (ctx) => writeFile(ctx.seeded.allocation.artifactPath, artifactBody(ctx.seeded.runId).replace("Completed", "Finished"), { mode: 0o600 }) },
+    { name: "trace unreadable", reason: "trace_source_unreadable", mutate: (ctx) => rm(ctx.seeded.tracePath) },
+    {
+      name: "session pointer invalid (relative Pi path)",
+      reason: "trace_session_pointer_invalid",
+      sweepOnly: true,
+      seed: { session: { ...childSession, value: "relative.jsonl" }, history: { kind: "pi-jsonl", session: { ...childSession, value: "relative.jsonl" }, position: { path: "/relative.jsonl", offset: 0, anchor: createHash("sha256").digest("hex") } } },
+      mutate: noop,
+    },
+    { name: "malformed trace line", reason: "trace_source_malformed", mutate: (ctx) => appendFile(ctx.seeded.tracePath, "{not json\n") },
+    { name: "Devin document over budget", kind: "devin", reason: "trace_source_exceeds_budget", mutate: async (ctx) => { ctx.scripted.scan = { kind: "failure", failure: "source_exceeds_budget", reason: "document" }; } },
+    { name: "unterminated bytes at EOF", reason: "trace_pending_tail", mutate: (ctx) => appendTrace(ctx.fx, "pi", childSession, [], '{"type":"message","message":{"role":"user"') },
+    { name: "tail never reached the slack boundary", reason: "trace_ambiguous:scan_budget", mutate: async (ctx) => { ctx.scripted.scan = { kind: "ambiguous", reason: "scan_budget" }; } },
+    { name: "user turn at or after the anchor", reason: "trace_follow_up", mutate: (ctx) => appendTrace(ctx.fx, "pi", childSession, [piEntry("user", 0)]) },
+    { name: "user turn without a parseable time", reason: "trace_ambiguous:timestamp_missing", mutate: (ctx) => appendTrace(ctx.fx, "pi", childSession, [{ type: "message", id: "u", message: { role: "user", content: "redacted" } }]) },
+    { name: "Pi compaction at or after the anchor", reason: "trace_ambiguous:compaction", mutate: (ctx) => appendTrace(ctx.fx, "pi", childSession, [{ type: "compaction", id: "c", timestamp: at(10), summary: "redacted", firstKeptEntryId: "m", tokensBefore: 1 }]) },
+    { name: "Devin composer: queued input", kind: "devin", reason: "composer_queued", mutate: async (ctx) => { ctx.live.ansi = REAL_QUEUED; } },
+    { name: "Devin composer: a draft", kind: "devin", reason: "composer_draft", mutate: async (ctx) => { ctx.live.ansi = COMPOSER_DRAFT; } },
+    { name: "Devin composer: unreadable frame", kind: "devin", reason: "composer_unreadable", state: "deferred", mutate: async (ctx) => { ctx.live.ansi = "no composer here\n"; } },
+  ];
+  const readHandoffStateOf = async (ctx: Ctx) => (await import("../../src/handoff.js")).readHandoffState(ctx.seeded.allocation);
+
+  async function stage(row: Row): Promise<{ ctx: Ctx; scan: TailScanner }> {
+    const fx = await fixture();
+    const kind = row.kind ?? "pi";
+    const seeded = await seedRun(fx, { agentKind: kind, ...row.seed });
+    const live = liveFor(kind);
+    if (row.seed?.session !== undefined) {
+      const over = { agent_session: { ...row.seed.session }, tokens: childTokens(row.seed.session) };
+      live.pane = childPane(over);
+      live.agent = childAgent(over);
+    }
+    const ctx: Ctx = { fx, seeded, live, scripted: {} };
+    const scan: TailScanner = async (target, anchorMs, history, deps) => ctx.scripted.scan ?? tailScan(target, anchorMs, history, deps);
+    return { ctx, scan };
+  }
+
+  it.each(ROWS)("sweep: $name → $reason", async (row) => {
+    const { ctx, scan } = await stage(row);
+    await row.mutate(ctx);
+    const { deps, clock } = retirerDeps(ctx.fx, ctx.live, { trace: { scan, trace: traceDepsFor(ctx.fx) } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(ctx.seeded.runId)).toMatchObject({ state: row.state ?? "refused", reason: row.reason });
+    expect(ctx.live.pane).not.toBeUndefined();
+    expect(closes(deps)).toEqual([]);
+    // The refusal is re-evaluated every sweep but journaled once, with vocabulary only.
+    await retirer.sweep();
+    const lines = ctx.fx.lines.filter((line) => line.includes(`run=${ctx.seeded.runId}`) && line.includes(`reason=${row.reason}`));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("redacted");
+  });
+
+  it.each(ROWS.filter((row) => row.sweepOnly !== true))("lock: $name → recheck_$reason, no close dispatched", async (row) => {
+    const { ctx, scan } = await stage(row);
+    const lock = fakePaneLock({ onAcquire: async () => { await row.mutate(ctx); } });
+    const { deps, clock } = retirerDeps(ctx.fx, ctx.live, { trace: { scan, trace: traceDepsFor(ctx.fx) }, options: { paneLock: lock.guard } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(lock.acquired).toEqual(["p-child"]);
+    expect(retirer.view(ctx.seeded.runId)).toMatchObject({ state: row.state ?? "refused", reason: `recheck_${row.reason}` });
+    expect(ctx.live.pane).not.toBeUndefined();
+    expect(closes(deps)).toEqual([]);
+  });
+
+  it.each(["pi", "claude", "devin"] as const)("retires a clean idle %s lane that passes the artifact, history, tail and composer checks", async (kind) => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: kind });
+    const live = liveFor(kind);
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { trace: { scan: counting.scan, trace: traceDepsFor(fx) } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(live.pane).toBeUndefined();
+    // Two sweeps plus the lock: every check scanned against the PERSISTED anchor.
+    expect(counting.calls).toEqual([ANCHOR_MS, ANCHOR_MS, ANCHOR_MS]);
+    const composerReads = (deps.cli as FakeCli).calls.filter((argv) => argv.includes("ansi"));
+    if (kind === "devin") {
+      // The guard issues exactly the production flush's ansi visible read, in the sweep and under the lock.
+      expect(composerReads).toEqual([devinComposerReadArgv("p-child"), devinComposerReadArgv("p-child"), devinComposerReadArgv("p-child")]);
+    } else {
+      expect(composerReads).toEqual([]);
+    }
+  });
+
+  it("performs no trace read for an absent child", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    const counting = countingScan();
+    const live: Live = {};
+    const { deps } = retirerDeps(fx, live, { trace: { scan: counting.scan, trace: traceDepsFor(fx) } });
+    const retirer = createLaneRetirer(deps);
+    await retirer.sweep();
+    expect(retirer.view(runId)).toBeUndefined();
+    expect(counting.calls).toEqual([]);
+  });
+
+  it("refuses a follow-up written between the artifact write and the acceptance, and a re-acceptance of a newer artifact clears it", async () => {
+    const fx = await fixture();
+    // The follow-up's timestamp is after the artifact's write time even though
+    // the acceptance (and the fingerprint capture) came later still.
+    const { allocation, runId } = await seedRun(fx, { trace: [...PI_QUIET, piEntry("user", 500)] });
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_follow_up" });
+
+    // Re-acceptance: a changed artifact written after the follow-up, validated anew.
+    const content = artifactBody(runId).replace("Completed", "Answered the follow-up and completed");
+    await writeFile(allocation.artifactPath, content, { mode: 0o600 });
+    await utimes(allocation.artifactPath, new Date(ANCHOR_MS + 5_000), new Date(ANCHOR_MS + 5_000));
+    const history = await captureTraceHistory({ agentKind: "pi", agentSession: childSession }, { resolvedCwd: WORKSPACE_CWD }, new AbortController().signal, traceDepsFor(fx));
+    const mtimeMs = Math.floor((await stat(allocation.artifactPath)).mtimeMs);
+    await updateHandoffState(allocation, (state) => {
+      state.artifact.sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+      state.artifact.bytes = Buffer.byteLength(content);
+      state.artifact.version = 2;
+      state.artifact.mtimeMs = mtimeMs;
+      state.artifact.traceHistory = history;
+    });
+    expect(mtimeMs).toBeGreaterThan(ANCHOR_MS + 500);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+  });
+
+  it("F13: a byte-identical artifact rewrite after a downtime follow-up never moves the anchor — refused in the sweep and under the lock", async () => {
+    // Accept at T1 (anchor), restart (a fresh retirer over the sidecar),
+    // follow-up at T2, identical bytes rewritten at T3 with a newer file mtime.
+    const fx = await fixture();
+    const { allocation, runId } = await seedRun(fx);
+    await appendTrace(fx, "pi", childSession, [piEntry("user", 60_000), piEntry("assistant", 70_000)]);
+    await writeFile(allocation.artifactPath, artifactBody(runId), { mode: 0o600 });
+    await utimes(allocation.artifactPath, new Date(ANCHOR_MS + 120_000), new Date(ANCHOR_MS + 120_000));
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { trace: { scan: counting.scan, trace: traceDepsFor(fx) } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_follow_up" });
+    expect(counting.calls).toEqual([ANCHOR_MS, ANCHOR_MS]);
+    expect((await (await import("../../src/handoff.js")).readHandoffState(allocation)).artifact.mtimeMs).toBe(ANCHOR_MS);
+
+    // The same sequence inside the lock window.
+    const fx2 = await fixture();
+    const late = await seedRun(fx2);
+    const lock = fakePaneLock({
+      onAcquire: async () => {
+        await appendTrace(fx2, "pi", childSession, [piEntry("user", 60_000)]);
+        await writeFile(late.allocation.artifactPath, artifactBody(late.runId), { mode: 0o600 });
+        await utimes(late.allocation.artifactPath, new Date(ANCHOR_MS + 120_000), new Date(ANCHOR_MS + 120_000));
+      },
+    });
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    const counting2 = countingScan();
+    const deps2 = retirerDeps(fx2, live2, { trace: { scan: counting2.scan, trace: traceDepsFor(fx2) }, options: { paneLock: lock.guard } });
+    const retirer2 = createLaneRetirer(deps2.deps);
+    await sweepPastGrace(retirer2, deps2.clock);
+    expect(retirer2.view(late.runId)).toMatchObject({ state: "refused", reason: "recheck_trace_follow_up" });
+    expect(counting2.calls.every((anchor) => anchor === ANCHOR_MS)).toBe(true);
+    expect(closes(deps2.deps)).toEqual([]);
+    expect(live2.pane).not.toBeUndefined();
+  });
+
+  it("F15: a same-session /revert of the Devin trace to a pre-artifact prefix refuses as rewritten, in the sweep and under the lock", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    // Downtime follow-up, then `/revert` to a step before the artifact write:
+    // the follow-up is gone and only pre-anchor steps remain.
+    await writeTrace(fx, "devin", devinSession, devinDoc([...DEVIN_QUIET, { source: "user", deltaMs: 60_000 }]));
+    await writeTrace(fx, "devin", devinSession, devinDoc(DEVIN_QUIET.slice(0, 2)));
+    const live = liveFor("devin");
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_source_rewritten" });
+
+    const fx2 = await fixture();
+    const late = await seedRun(fx2, { agentKind: "devin" });
+    const lock = fakePaneLock({ onAcquire: () => writeTrace(fx2, "devin", devinSession, devinDoc(DEVIN_QUIET.slice(0, 2))).then(() => undefined) });
+    const live2 = liveFor("devin");
+    const deps2 = retirerDeps(fx2, live2, { options: { paneLock: lock.guard } });
+    const retirer2 = createLaneRetirer(deps2.deps);
+    await sweepPastGrace(retirer2, deps2.clock);
+    expect(retirer2.view(late.runId)).toMatchObject({ state: "refused", reason: "recheck_trace_source_rewritten" });
+    expect(closes(deps2.deps)).toEqual([]);
+  });
+
+  it("a partial user record under the lock refuses before closeWithReadback and spends no attempt", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    let staged = false;
+    const lock = fakePaneLock({
+      onAcquire: async () => {
+        if (staged) return;
+        staged = true;
+        await appendTrace(fx, "pi", childSession, [], '{"type":"message","id":"u","timestamp":"');
+      },
+    });
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard, maxAttempts: 1 } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "recheck_trace_pending_tail" });
+    expect(closes(deps)).toEqual([]);
+    // The writer finishes the record as a pre-anchor assistant turn: with a
+    // single allowed attempt, the lane can only retire if none was spent.
+    await appendFile(tracePath(fx, "pi", childSession), `${at(-1_000)}","message":{"role":"assistant","content":"redacted"}}\n`);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+  });
+
+  it("F1: a follow-up landing after the under-lock lifecycle and screen reads is caught by the final veto, and the clock restarts", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const lock = fakePaneLock();
+    let injected = false;
+    const cli = fakeCli(live, {
+      onRead: async () => {
+        // The lock's own screen read has just been served: the pane is proven
+        // idle and unchanged, and only the final veto stands between here and
+        // the close dispatch.
+        if (lock.acquired.length === 0 || injected) return;
+        injected = true;
+        await appendTrace(fx, "pi", childSession, [piEntry("user", 1_000)]);
+      },
+    });
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { cli, trace: { scan: counting.scan, trace: traceDepsFor(fx) }, options: { paneLock: lock.guard } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(injected).toBe(true);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "recheck_trace_follow_up" });
+    expect(closes(deps)).toEqual([]);
+    expect(live.pane).not.toBeUndefined();
+    // The veto was the last read: it ran after the lock's pane/agent gets and screen read.
+    const calls = (deps.cli as FakeCli).calls;
+    expect(calls.filter((argv) => argv[1] === "get")).toHaveLength(2);
+    expect(counting.calls).toHaveLength(3);
+    // F2: the lock-window refusal left the lane unobserved — the clock restarted.
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_follow_up" });
+  });
+
+  it("F1: a daemon-mediated prompt cannot take the pane-write section while the close holds it", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const lockDir = join(fx.traceRoot, "..", "pane-locks");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    const guard = createPaneWriteGuard({ namespace: { dir: lockDir, endpoint: join(fx.traceRoot, "..", "herdr.sock") } });
+    let section: unknown = "not attempted";
+    const cli = fakeCli(live, {
+      onClose: async () => {
+        // Every daemon prompt path (communicate, wakes, launch, hints, the
+        // repair prompt) takes this section first; mid-dispatch it is held.
+        const flush = createDevinQueueFlush({ cli: deps.cli, guard, sectionWaitMs: 200 });
+        try {
+          const lease = await flush.writeSection("p-child");
+          await lease.release();
+          section = "acquired";
+        } catch (error) {
+          section = error;
+        }
+      },
+    });
+    const { deps, clock } = retirerDeps(fx, live, { cli, options: { paneLock: guard } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(section).toBeInstanceOf(PaneWriteLockError);
+    expect((section as PaneWriteLockError).code).toBe("PANE_WRITE_LOCK_UNAVAILABLE");
+    // Released with the close: the section is free again.
+    const after = await createDevinQueueFlush({ cli: deps.cli, guard, sectionWaitMs: 200 }).writeSection("p-child");
+    await after.release();
+  }, 20_000);
+
+  it("F2: a veto that skips the observation restarts the grace — recovery needs a fresh full grace", async () => {
+    // A Devin lane whose composer frame becomes unreadable mid-grace.
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    const live = liveFor("devin");
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    live.ansi = "no composer here\n";
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "composer_unreadable" });
+    delete live.ansi;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    expect(live.pane).not.toBeUndefined();
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+
+    // The same for a transient trace refusal on a Pi lane.
+    const fx2 = await fixture();
+    const second = await seedRun(fx2);
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    const deps2 = retirerDeps(fx2, live2);
+    const retirer2 = createLaneRetirer(deps2.deps);
+    await retirer2.sweep();
+    await appendTrace(fx2, "pi", childSession, [], '{"type":"message","id":"u","timestamp":"');
+    deps2.clock.nowMs += GRACE_MS;
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "refused", reason: "trace_pending_tail" });
+    await appendFile(tracePath(fx2, "pi", childSession), `${at(-1_000)}","message":{"role":"assistant","content":"redacted"}}\n`);
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    expect(live2.pane).not.toBeUndefined();
+    deps2.clock.nowMs += GRACE_MS;
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "retired" });
+  });
+
+  it("F4: a token-kept lane performs no trace read or composer read", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    const live = liveFor("devin");
+    live.pane = childPane({ ...live.pane, tokens: childTokens(devinSession, { retention: "keep" }) });
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { trace: { scan: counting.scan, trace: traceDepsFor(fx) } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    expect(counting.calls).toEqual([]);
+    expect((deps.cli as FakeCli).calls.filter((argv) => argv.includes("ansi"))).toEqual([]);
+    // Clearing the token starts a fresh grace and the proof runs from then on.
+    live.pane = childPane({ ...live.pane, tokens: childTokens(devinSession) });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(counting.calls.length).toBeGreaterThan(0);
+  });
+
+  it("a Devin composer read that throws defers as unreadable", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    const live = liveFor("devin");
+    const { deps, clock } = retirerDeps(fx, live, { cli: fakeCli(live, { readError: Object.assign(new Error("gone"), { code: "CLI_UNAVAILABLE" }) }) });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "composer_unreadable" });
+    expect(closes(deps)).toEqual([]);
+  });
+
+  it("a Claude lane whose workspace is unbound cannot resolve its trace and never retires", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "claude", workspace: false, history: { kind: "claude-jsonl", session: claudeSession, position: { path: "/x.jsonl", offset: 0, anchor: createHash("sha256").digest("hex") } } });
+    const live = liveFor("claude");
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_session_pointer_invalid" });
   });
 });

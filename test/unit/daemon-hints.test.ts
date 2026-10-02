@@ -14,7 +14,7 @@
  * `herdr_status` projects `pendingTransfers` strictly read-only.
  */
 
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -80,6 +80,7 @@ interface SinkFixture {
 async function sinkFixture(options: {
   qualifiedKinds?: readonly string[];
   qualifiedSet?: "absent";
+  writeSection?: (paneId: string) => Promise<{ release(): Promise<void> }>;
   paneStatus?: string;
   /** Omit `agent_status` entirely — an unproven state, not a named one. */
   statusOmitted?: boolean;
@@ -124,6 +125,7 @@ async function sinkFixture(options: {
     cli,
     mailbox,
     namespace,
+    ...(options.writeSection === undefined ? {} : { writeSection: options.writeSection }),
     ...(options.qualifiedSet === "absent" ? {} : { qualifiedKinds: options.qualifiedKinds ?? ["pi", "claude", "devin"] }),
     now: () => nowMs,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -350,9 +352,14 @@ async function daemonFixture(options: { hintKinds?: readonly string[]; ownerStat
     throw new Error(`unexpected argv: ${argv.join(" ")}`);
   };
   const promptClient: AgentPromptClient = { prompt, ping: async () => undefined };
+  // A realpath-able stand-in for the Herdr socket: the hint's prompt rides the
+  // pane-write section (ADR-040 amendment, R2), whose lock namespace derives
+  // from the canonical socket path.
+  const socketPath = join(root, "herdr.sock");
+  await writeFile(socketPath, "");
   const runtime = createDaemonRuntime({
     exec,
-    env: {},
+    env: { HERDR_SOCKET_PATH: socketPath },
     promptClient,
     namespace,
     intents: createIntentStore({ namespace }),
@@ -494,5 +501,22 @@ describe("bound supervisor hint destination", () => {
     // The registry forwards the diagnostic sink into every reserved supervisor.
     expect(logs.some((line) => line.startsWith("supervisor_settled"))).toBe(true);
     jobs.shutdown();
+  });
+});
+
+describe("idle hints: pane-write section (ADR-040 amendment, R2)", () => {
+  it("takes and releases the shared lease around the prompt when one is wired", async () => {
+    const events: string[] = [];
+    const f = await sinkFixture({
+      writeSection: async (paneId) => {
+        events.push(`acquire:${paneId}`);
+        return { release: async () => { events.push(`release:${paneId}`); } };
+      },
+    });
+    const written = await f.mailbox.writeGapEvent(ownerKey, { from: "a", to: "b", lost: {} });
+    if (!written.persisted) throw new Error("fixture write failed");
+    f.hints(hint());
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+    expect(events).toEqual(["acquire:p-owner", "release:p-owner"]);
   });
 });

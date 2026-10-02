@@ -742,12 +742,15 @@ describe("herdr_communicate", () => {
     expect(promptFlush.schedule).toHaveBeenCalledTimes(1);
     expect(promptResult.details).toMatchObject({ outcome: "sent", route: "prompt_direct", preState: { agent_status: "working" } });
 
-    // A non-Devin target never touches the coordinator even when one is wired.
+    // A non-Devin target rides the same pane-write section (ADR-040 amendment,
+    // R2: a retirement close holding the lease cannot dispatch between its
+    // final trace read and this acknowledgement) but never schedules a flush.
     const pi = makeCli("working");
-    const piFlush = fakeQueueFlush([]);
+    const piEvents: string[] = [];
+    const piFlush = fakeQueueFlush(piEvents);
     await createCommunicateTool({ cli: pi.cli, context, queueFlush: piFlush.flush })
       .execute("id", { target: "reviewer", operation: "steer", text: "pi direction" }, new AbortController().signal, undefined, extensionContext);
-    expect(piFlush.writeSection).not.toHaveBeenCalled();
+    expect(piEvents).toEqual(["acquire", "release"]);
     expect(piFlush.schedule).not.toHaveBeenCalled();
   });
 

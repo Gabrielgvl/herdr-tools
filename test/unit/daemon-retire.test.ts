@@ -596,6 +596,35 @@ describe("lane retirer (ADR-040)", () => {
     expect(fx.lines.some((line) => line.includes(`run=${absent.runId}`) && line.includes("decision=skipped reason=child_absent"))).toBe(true);
   });
 
+  it("journals a skipped child_absent once per decision change, not once per sweep", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx.allocator);
+    const live: Live = {};
+    const { deps } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    const skips = () => fx.lines.filter((line) => line.includes(`run=${runId}`) && line.includes("decision=skipped reason=child_absent"));
+
+    // A long-gone child is skipped on every sweep but journaled only once.
+    await retirer.sweep();
+    await retirer.sweep();
+    await retirer.sweep();
+    expect(retirer.view(runId)).toBeUndefined();
+    expect(skips()).toHaveLength(1);
+
+    // The pane reappears: a changed decision journals, and the renewed
+    // absence journals the skip again — a change, never a repetition.
+    live.pane = childPane();
+    live.agent = childAgent();
+    await retirer.sweep();
+    expect(skips()).toHaveLength(1);
+    expect(fx.lines.some((line) => line.includes(`run=${runId}`) && line.includes("decision=watching"))).toBe(true);
+    live.pane = undefined;
+    live.agent = undefined;
+    await retirer.sweep();
+    await retirer.sweep();
+    expect(skips()).toHaveLength(2);
+  });
+
   it("resets the stability clock on seq changes and on working status", async () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);

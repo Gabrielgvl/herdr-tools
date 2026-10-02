@@ -168,8 +168,6 @@ interface LaneEntry {
   /** Close attempts spent — a lock or re-proof refusal never spends one. */
   attempts: number;
   view: RetireView;
-  /** `<decision>:<reason>` last journaled — one line per change, not per sweep. */
-  journaled?: string;
 }
 
 /** One coherent lifecycle observation: the agent record's own status and counter. */
@@ -239,14 +237,25 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
   const ledger = new Map<string, LaneEntry>();
   /** Runs this daemon provably closed — the `job_terminal` suppression marker. */
   const retired = new Set<string>();
+  /**
+   * Each run's last journaled `<decision>:<reason>`. It lives outside the
+   * ledger because decisions that drop the entry — a skipped absent child —
+   * must still dedupe across sweeps; the sweep prunes it to the run
+   * directories it observed.
+   */
+  const journaled = new Map<string, string>();
+
+  /** Journals `line` only when `key` differs from the run's last journaled decision. */
+  function journalKey(runId: string, key: string, line: string): void {
+    if (journaled.get(runId) === key) return;
+    journaled.set(runId, key);
+    log(line);
+  }
 
   /** One bounded journal line per decision change — never per sweep. */
   function journal(runId: string, entry: LaneEntry, decision?: string): void {
     const outcome = decision ?? entry.view.state;
-    const key = `${outcome}:${entry.view.reason ?? "-"}`;
-    if (entry.journaled === key) return;
-    entry.journaled = key;
-    log(`herdr-tools-daemon lane_retire run=${runId} decision=${outcome}${entry.view.reason === undefined ? "" : ` reason=${entry.view.reason}`}`);
+    journalKey(runId, `${outcome}:${entry.view.reason ?? "-"}`, `herdr-tools-daemon lane_retire run=${runId} decision=${outcome}${entry.view.reason === undefined ? "" : ` reason=${entry.view.reason}`}`);
   }
 
   function setView(runId: string, entry: LaneEntry, state: RetireView["state"], reason?: string, stableForMs?: number, decision?: string): void {
@@ -601,8 +610,10 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
 
     const verdict = classifyChild(snapshot, state);
     if (verdict.kind === "absent") {
+      // No ledger entry survives a skip, so the sweep-level journal record
+      // carries the dedupe — a long-gone child logs once, not every sweep.
       ledger.delete(runId);
-      log(`herdr-tools-daemon lane_retire run=${runId} decision=skipped reason=child_absent`);
+      journalKey(runId, "skipped:child_absent", `herdr-tools-daemon lane_retire run=${runId} decision=skipped reason=child_absent`);
       return;
     }
     if (verdict.kind === "ambiguous") {
@@ -742,9 +753,11 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
           log(`herdr-tools-daemon lane_retire run=${entry.name} decision=sweep_error reason=${bounded(codeOf(error))}`);
         }
       }
-      // A vanished run directory leaves nothing to project or retire.
-      for (const runId of [...ledger.keys()]) {
-        if (!seen.has(runId)) ledger.delete(runId);
+      // A vanished run directory leaves nothing to project, retire, or dedupe.
+      for (const runId of new Set([...ledger.keys(), ...journaled.keys()])) {
+        if (seen.has(runId)) continue;
+        ledger.delete(runId);
+        journaled.delete(runId);
       }
     },
     view(runId) {

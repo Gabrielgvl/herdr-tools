@@ -30,8 +30,10 @@
  * 6. a `focused` pane defers, but only for a bounded number of sweeps
  *    (`maxFocusDefers`) — a stuck focus flag cannot park a finished lane;
  * 7. `retention: "keep"` (task field or pane token) marks the run `kept` and
- *    never retires; the kill switch turns an otherwise-eligible close into a
- *    journaled `would_retire` and a `disabled` view.
+ *    never retires — the task field for good, the pane token for as long as
+ *    it stays set (clearing it releases the lane on the next sweep); the kill
+ *    switch turns an otherwise-eligible close into a journaled `would_retire`
+ *    and a `disabled` view.
  *
  * The close itself runs under the pane write lock and the run flock — the
  * lock ownership transfers and sidecar mutations take — and re-proves the
@@ -149,8 +151,10 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const BOUNDED_CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
 /** Intent-child run lifecycles that mean the recorded child is finished. */
 const TERMINAL_CHILD_LIFECYCLES = new Set<HandoffLifecycleState>(["handed_off", "cancelled", "failed"]);
-/** Terminal views persist: a run stays retired/failed/kept once decided. */
-const TERMINAL_VIEWS = new Set<RetireView["state"]>(["retired", "failed", "kept"]);
+/** Terminal views persist: a run stays retired/failed once decided. */
+const TERMINAL_VIEWS = new Set<RetireView["state"]>(["retired", "failed"]);
+/** The immutable task-field keep is terminal too; the pane-token keep is re-read every sweep (F15). */
+const TASK_KEEP_REASON = "task_retention_keep";
 
 interface LaneEntry {
   /** The continuously observed `state_change_seq` — the stability clock's value. */
@@ -180,10 +184,13 @@ interface Veto {
   reason: string;
 }
 
-/** What the under-lock section decided; the proven-close event write happens after the run flock releases. */
+/** What the under-lock section decided; only the `lane_retired` mailbox write happens after the run flock releases. */
 type LockedOutcome =
   | { kind: "settled" }
-  | { kind: "closed"; reconciled: boolean }
+  /** The readback proved our own mutation: marker published and jobId captured under the flock. */
+  | { kind: "retired"; jobId: string }
+  /** The pane is gone but no mutation of ours proved it — another actor's close. */
+  | { kind: "reconciled_absent" }
   | { kind: "faulted"; error: unknown };
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
@@ -410,7 +417,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
 
     const provenance = await readProvenance(run);
     if ("refusal" in provenance) return settle("deferred", `recheck_${provenance.refusal}`);
-    if (provenance.provenance?.task.retention === "keep") return settle("kept", "task_retention_keep");
+    if (provenance.provenance?.task.retention === "keep") return settle("kept", TASK_KEEP_REASON);
     const retentionToken = mergedToken(records, "retention");
     if (retentionToken.state === "value" && retentionToken.value === "keep") return settle("kept", "token_retention_keep");
     // The owner chain against a fresh snapshot: a transfer that landed since
@@ -451,11 +458,22 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
         targetPresent: (after) => after.panes.some((candidate) => candidate.pane_id === paneId),
         summarize: topologySummary,
       });
-      // Only the close's own readback-proven success confirms the marker the
-      // supervisor consults; an absent-without-mutation outcome lets the
-      // pane_closed wake land normally.
-      finish(closed.reconciled === false);
-      return { kind: "closed", reconciled: closed.reconciled };
+      if (closed.reconciled) {
+        // Absent without a mutation of ours: no marker, and the pane_closed
+        // wake lands normally.
+        finish(false);
+        return { kind: "reconciled_absent" };
+      }
+      // F14 ordering: `finish(true)` resolves a supervisor already waiting in
+      // `selfClose.consume`, and its settlement can run before this flock
+      // releases. The marker `JobRegistry` consults and the live supervisor's
+      // jobId must therefore both exist before the waiter is released — the
+      // restart case has no supervisor, and the event names the retirer itself.
+      retired.add(runId);
+      const jobId = deps.jobs.activeSupervisorFor(identity)?.jobId ?? "daemon-retire";
+      setView(runId, entry, "retired", undefined, undefined, `retired pane=${paneId}`);
+      finish(true);
+      return { kind: "retired", jobId };
     } catch (error) {
       finish(false);
       const code = `close_${codeOf(error)}`;
@@ -475,8 +493,10 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     }
     try {
       // The run flock serializes the re-proof and the close against ownership
-      // transfers and sidecar mutations. `lane_retired` is written only after
-      // it releases: the mailbox resolves the owner under the same flock.
+      // transfers and sidecar mutations; a proven close publishes its marker
+      // and captures the supervisor jobId inside it. Only `lane_retired` is
+      // written after it releases: the mailbox resolves the owner under the
+      // same flock.
       let outcome: LockedOutcome | undefined;
       try {
         await deps.ownership.withRunFlock(runId, async () => {
@@ -496,7 +516,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       }
       if (outcome.kind === "faulted") throw outcome.error;
       if (outcome.kind === "settled") return;
-      if (outcome.reconciled) {
+      if (outcome.kind === "reconciled_absent") {
         // The pane is gone, but no mutation of ours proved it: another actor
         // closed it in the window. Neither the marker nor a `lane_retired`
         // claim — the supervisor's own pane_closed path settles the run and
@@ -505,11 +525,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
         setView(runId, entry, "deferred", "close_reconciled_absent");
         return;
       }
-      retired.add(runId);
-      setView(runId, entry, "retired", undefined, undefined, `retired pane=${paneId}`);
-      // The live supervisor's jobId when one is still bound — the restart case
-      // has none, and the event names the retirer itself.
-      const jobId = deps.jobs.activeSupervisorFor(identity)?.jobId ?? "daemon-retire";
+      const { jobId } = outcome;
       try {
         const result = await deps.mailbox.writeRunEvent({
           kind: "lane_retired",
@@ -534,7 +550,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
 
   async function evaluate(runId: string, snapshot: HerdrSnapshot): Promise<void> {
     const prior = ledger.get(runId);
-    if (prior !== undefined && TERMINAL_VIEWS.has(prior.view.state)) return;
+    if (prior !== undefined && (TERMINAL_VIEWS.has(prior.view.state) || (prior.view.state === "kept" && prior.view.reason === TASK_KEEP_REASON))) return;
     const entry = prior ?? { focusDefers: 0, attempts: 0, view: { state: "watching" as const } };
 
     let run: HandoffAllocation;
@@ -567,7 +583,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     // The ADR-040 opt-out precedes live-identity work: a kept run never
     // retires, so nothing past this point is worth proving for it.
     if (provenance?.task.retention === "keep") {
-      setView(runId, entry, "kept", "task_retention_keep");
+      setView(runId, entry, "kept", TASK_KEEP_REASON);
       return;
     }
     // The child's own session key — the sub-manager and mailbox guards key on
@@ -643,6 +659,9 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     // pane token parks the lane exactly like the task field.
     const retentionToken = mergedToken(records, "retention");
     if (retentionToken.state === "value" && retentionToken.value === "keep") {
+      // A kept lane accrues no grace: clearing the token restarts the full
+      // stability window, so the person who released it gets the grace too.
+      resetClock(entry);
       setView(runId, entry, "kept", "token_retention_keep");
       return;
     }

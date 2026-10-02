@@ -44,7 +44,7 @@ The daemon runs a **lane-retirement sweep** on its own cadence (`HERDR_TOOLS_RET
 herdr pane report-metadata <pane> --source owner-retention --token retention=keep
 ```
 
-The dedicated `--source owner-retention` keeps the herdr-tools identity tokens (`identity_provenance`, `identity_actor`, `identity_session`, written under `--source herdr-tools`) intact — reporting under the package's own source would replace them. The sweep reads the merged token on the pane and agent records, so the lane turns `kept` on the next sweep; `--clear-token retention` under the same source releases it.
+The dedicated `--source owner-retention` keeps the herdr-tools identity tokens (`identity_provenance`, `identity_actor`, `identity_session`, written under `--source herdr-tools`) intact — reporting under the package's own source would replace them. The sweep reads the merged token on the pane and agent records, so the lane turns `kept` on the next sweep. A token-kept lane is re-read every sweep, so `--clear-token retention` under the same source releases it: a kept lane accrues no grace, so clearing the token restarts the full stability window and the lane can retire only after a fresh grace. Only the token keep is reversible this way; a lane kept by the task field `retention: "keep"` is terminal for the daemon's lifetime and no pane token releases it.
 
 ## Residual risk
 

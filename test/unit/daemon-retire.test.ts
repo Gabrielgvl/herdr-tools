@@ -488,6 +488,44 @@ describe("lane retirer (ADR-040)", () => {
     expect(await fx.mailbox.read(successorKey, unread[0]!)).toMatchObject({ kind: "lane_retired", runId, jobId: "job_live" });
   });
 
+  it("F14: the retired marker and the live supervisor jobId exist before the self-close waiter resolves", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx.allocator);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const selfClose = createSelfCloseTracker();
+    // The supervisor settles the instant its pending claim resolves — the
+    // JobRegistry runner then skips the settled record, so a lookup after that
+    // moment loses the jobId; its persistTerminalEvent reads the marker there too.
+    let settled = false;
+    let markerAtWake: boolean | undefined;
+    let waiter: Promise<boolean> | undefined;
+    const jobs = { activeSupervisorFor: () => (settled ? undefined : { jobId: "job_live" }) } as unknown as Pick<JobRegistry, "activeSupervisorFor">;
+    const cli = fakeCli(live, {
+      onClose: async () => {
+        // Mid-close, the supervisor has observed the pane absent and claimed the
+        // pending attempt; it is now waiting on the daemon's outcome.
+        const claim = selfClose.consume("p-child");
+        expect(claim).toBeInstanceOf(Promise);
+        waiter = (claim as Promise<boolean>).then((suppress) => {
+          markerAtWake = retirer.retiredByDaemon(runId);
+          settled = true;
+          return suppress;
+        });
+      },
+    });
+    const { deps, clock } = retirerDeps(fx, live, { cli, selfClose, jobs });
+    // Declared after the closure that reads it; the closure only runs mid-close, once initialized.
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+
+    expect(await waiter).toBe(true);
+    expect(markerAtWake).toBe(true);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    const unread = await fx.mailbox.list(ownerKey);
+    expect(unread).toHaveLength(1);
+    expect(await fx.mailbox.read(ownerKey, unread[0]!)).toMatchObject({ kind: "lane_retired", runId, jobId: "job_live" });
+  });
+
   it("never retires a run whose lifecycle is not handed_off", async () => {
     const fx = await fixture();
     for (const lifecycle of ["awaiting_handoff", "recovery_pending", "cancelled", "failed"] as const) {
@@ -851,6 +889,40 @@ describe("lane retirer (ADR-040)", () => {
     const retirer2 = createLaneRetirer(deps2.deps);
     await sweepPastGrace(retirer2, deps2.clock);
     expect(retirer2.view(keptByToken.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+  });
+
+  it("F15: clearing the retention pane token releases a token-kept lane, while a task-field keep stays kept", async () => {
+    const fx = await fixture();
+    const keptByTask = await seedRun(fx.allocator, { task: { ...task, retention: "keep" } });
+    const keptByToken = await seedRun(fx.allocator);
+    const live: Live = {
+      pane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
+      agent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
+    };
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(keptByTask.runId)).toMatchObject({ state: "kept", reason: "task_retention_keep" });
+    expect(retirer.view(keptByToken.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    expect(closes(deps)).toHaveLength(0);
+
+    // `herdr pane report-metadata <pane> --source owner-retention --clear-token retention`
+    live.pane = childPane();
+    live.agent = childAgent();
+    // Clearing the token restarts the stability grace rather than retiring at once.
+    await retirer.sweep();
+    expect(retirer.view(keptByToken.runId)).toMatchObject({ state: "watching" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(live.pane).toBeUndefined();
+    expect(retirer.view(keptByToken.runId)).toMatchObject({ state: "retired" });
+    expect(retirer.retiredByDaemon(keptByToken.runId)).toBe(true);
+    expect(closes(deps)).toHaveLength(1);
+    // The immutable task field is not released by a pane-token change.
+    expect(retirer.view(keptByTask.runId)).toMatchObject({ state: "kept", reason: "task_retention_keep" });
+    expect(retirer.retiredByDaemon(keptByTask.runId)).toBe(false);
   });
 
   it("F4: an unreadable provenance never overrides a keep opt-out — only a genuinely missing record is legacy", async () => {

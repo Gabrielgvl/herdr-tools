@@ -40,6 +40,7 @@ import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { SupervisionWake } from "../../src/supervision/notify.js";
 import { createTraceSource } from "../../src/supervision/trace-source.js";
+import { appendSupervisionReview, reviewLogPaths } from "../../src/supervision/review-log.js";
 import { Supervisor, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 
 const dirs: string[] = [];
@@ -580,7 +581,15 @@ interface Harness {
   fireTimer(): void;
 }
 
-function supervisorHarness(options: { snapshots: HerdrSnapshot[]; gate?: HandoffGate; eventWriter?: MailboxEventWriter; updateThrows?: boolean }): Harness {
+function supervisorHarness(options: {
+  snapshots: HerdrSnapshot[];
+  gate?: HandoffGate;
+  eventWriter?: MailboxEventWriter;
+  updateThrows?: boolean;
+  child?: SupervisorDependencies["child"];
+  reviewer?: SupervisorDependencies["reviewer"];
+  reviewLog?: SupervisorDependencies["reviewLog"];
+}): Harness {
   const queue = [...options.snapshots];
   const wakes: SupervisionWake[] = [];
   const updates: Array<{ text: string; details: unknown }> = [];
@@ -596,7 +605,7 @@ function supervisorHarness(options: { snapshots: HerdrSnapshot[]; gate?: Handoff
   };
   const deps: SupervisorDependencies = {
     jobId: "job_mailbox",
-    child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
+    child: options.child ?? { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
     monitor: {
       addObserver: () => undefined,
       removeObserver: () => undefined,
@@ -609,8 +618,8 @@ function supervisorHarness(options: { snapshots: HerdrSnapshot[]; gate?: Handoff
       isDegraded: () => false,
     },
     notifier: { wake: (wake) => { wakes.push(wake); } },
-    reviewer: { review: async () => ({ classification: "blocked", summary: "stuck" }) },
-    reviewLog: async () => undefined,
+    reviewer: options.reviewer ?? { review: async () => ({ classification: "blocked", summary: "stuck" }) },
+    reviewLog: options.reviewLog ?? (async () => undefined),
     cadenceMs: 300_000,
     clock: { now: () => 1_000 },
     scheduler,
@@ -649,6 +658,51 @@ const stubView = (): SupervisionJobView => ({
 });
 
 describe("writer wiring seams", () => {
+  it.each(["claude", "devin"])("writes only one outage/recovery pair to the mailbox for sustained %s review-log failures", async (agentKind) => {
+    const { mailbox, namespace } = await fixture({ ownership: fixedOwner(mgrA) });
+    // A real append refusal, not a failed trace read: the log directory cannot
+    // be created. Only this test-owned namespace is altered.
+    const root = namespace.dir;
+    const obstruction = join(root, ".herdr");
+    await writeFile(obstruction, "not a directory", { mode: 0o600 });
+    const childSession = { source: `herdr:${agentKind}`, agent: agentKind, kind: "id", value: "s1" };
+    const writes: Promise<unknown>[] = [];
+    const h = supervisorHarness({
+      snapshots: [snapshot([{ ...paneRecord({ status: "working" }), agent: agentKind, agent_session: childSession }])],
+      child: { agentName: "worker", agentKind, operatingPointId: `worker-${agentKind}` },
+      gate: stubGate("run-1", "awaiting_handoff"),
+      eventWriter: { writeRunEvent: (input) => { const write = mailbox.writeRunEvent(input); writes.push(write); return write; } },
+      reviewer: { review: async () => ({ classification: "progress", summary: "moving" }) },
+      reviewLog: (entry) => appendSupervisionReview(entry, { root }),
+    });
+    const review = (): Promise<void> => (h.supervisor as unknown as { review(): Promise<void> }).review();
+    try {
+      await h.supervisor.bind({ identity: { ...identity, agentKind, agentSession: childSession }, operatingPointId: `worker-${agentKind}` });
+      for (let tick = 1; tick <= 5; tick += 1) {
+        await review();
+        await Promise.all(writes);
+        expect(h.supervisor.view().reviewer.degraded).toBe(true);
+        expect(writes).toHaveLength(tick < 3 ? 0 : 1);
+        expect(await mailbox.list(mgrA)).toHaveLength(tick < 3 ? 0 : 1);
+      }
+      expect(h.wakes[0]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
+      await rm(obstruction);
+      await review();
+      await review();
+      await Promise.all(writes);
+      expect(writes).toHaveLength(2);
+      const events = await Promise.all((await mailbox.list(mgrA)).map((id) => mailbox.read(mgrA, id)));
+      expect(events.map((event) => event.kind).sort()).toEqual(["reviewer_degraded", "reviewer_recovered"]);
+      expect(h.supervisor.view().reviewer.degraded).toBe(false);
+      const records = (await readFile(reviewLogPaths(root).reviews, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { provenance: { traceSource: string } });
+      expect(records).toHaveLength(2);
+      expect(records[0]!.provenance.traceSource).toBe(agentKind === "claude" ? "tmux-fallback" : "devin-session");
+    } finally {
+      h.supervisor.shutdown();
+      await Promise.all(writes);
+    }
+  });
+
   it("routes supervisor events through the writer and keeps supervision running at cap", async () => {
     const { mailbox, namespace } = await fixture({ ownership: fixedOwner(mgrA) });
     await seed(namespace, mgrA, "unread", MAILBOX_UNREAD_MAX_FILES);

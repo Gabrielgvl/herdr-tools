@@ -1,11 +1,15 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JsonEnvelope } from "../../src/cli.js";
 import {
   createDevinQueueFlush,
+  DEVIN_COMPOSER_READ_FLAGS,
+  devinComposerFromRead,
+  devinComposerReadArgv,
   queueFlushEligible,
+  readDevinComposer,
   type DevinQueueFlush,
   type DevinQueueFlushCli,
 } from "../../src/messages/devin-queue-flush.js";
@@ -576,5 +580,41 @@ describe("submitIfUnsent (launch-time composer resubmission)", () => {
     await expect(queueFlush.submitIfUnsent(PANE, submission, controller.signal)).resolves.toBe(false);
     expect(sendKeys(inner.calls)).toHaveLength(0);
     await settle(queueFlush);
+  });
+});
+
+describe("composer guard entry point (ADR-040 amendment node H)", () => {
+  /** The verbatim `pane read --source visible --format ansi` capture with queued wakes (test/fixtures/devin-composer-queued.ansi). */
+  const REAL_QUEUED = readFileSync(new URL("../fixtures/devin-composer-queued.ansi", import.meta.url), "utf8");
+  const ANSI_ARGV = ["pane", "read", PANE, "--source", "visible", "--format", "ansi"];
+
+  it("exports the exact production read argv", () => {
+    expect(devinComposerReadArgv(PANE)).toEqual(ANSI_ARGV);
+    expect([...DEVIN_COMPOSER_READ_FLAGS]).toEqual(["--source", "visible", "--format", "ansi"]);
+  });
+
+  it("parses the hint-only QUEUED fixture and the real capture as queued through the ansi argv", () => {
+    expect(devinComposerFromRead(ANSI_ARGV, { value: QUEUED, truncated: false })).toMatchObject({ queued: true, inputEmpty: true });
+    expect(devinComposerFromRead(ANSI_ARGV, { value: REAL_QUEUED, truncated: false })).toMatchObject({ queued: true, inputEmpty: true });
+    expect(devinComposerFromRead(ANSI_ARGV, { value: DRAINED, truncated: false })).toMatchObject({ queued: false, inputEmpty: true });
+    expect(devinComposerFromRead(ANSI_ARGV, { value: DRAFT, truncated: false })).toMatchObject({ inputEmpty: false });
+  });
+
+  it("refuses to parse anything but the ansi visible read, and refuses a truncated frame", () => {
+    // The retirement digest read: the same frame read as text would parse queued:false — fail open — so it is not parsed at all.
+    expect(devinComposerFromRead(["pane", "read", PANE, "--source", "detection", "--format", "text"], { value: QUEUED, truncated: false })).toBeUndefined();
+    expect(devinComposerFromRead(["pane", "read", PANE, "--source", "visible", "--format", "text"], { value: REAL_QUEUED, truncated: false })).toBeUndefined();
+    expect(devinComposerFromRead(["pane", "read", PANE, "--source", "detection", "--format", "ansi"], { value: QUEUED, truncated: false })).toBeUndefined();
+    expect(devinComposerFromRead(["pane", "read", PANE], { value: QUEUED, truncated: false })).toBeUndefined();
+    expect(devinComposerFromRead(["agent", "read", PANE, "--source", "visible", "--format", "ansi"], { value: QUEUED, truncated: false })).toBeUndefined();
+    expect(devinComposerFromRead(ANSI_ARGV, { value: QUEUED, truncated: true })).toBeUndefined();
+    expect(devinComposerFromRead(ANSI_ARGV, { value: GARBAGE, truncated: false })).toBeUndefined();
+  });
+
+  it("readDevinComposer issues the ansi argv and parses through the guard", async () => {
+    const calls: string[][] = [];
+    const cli = { runTextResult: async (argv: string[]) => { calls.push([...argv]); return { value: REAL_QUEUED, truncated: false }; } };
+    expect(await readDevinComposer(cli, PANE, new AbortController().signal)).toMatchObject({ queued: true });
+    expect(calls).toEqual([ANSI_ARGV]);
   });
 });

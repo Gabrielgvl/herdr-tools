@@ -79,12 +79,44 @@ export function devinCliDataDir(): string {
 }
 
 /** Devin's record directory: `$XDG_DATA_HOME/devin/cli/transcripts`. */
-function defaultTranscriptsDir(): string {
+export function devinTranscriptsDir(): string {
   return join(devinCliDataDir(), "transcripts");
 }
 
 const nodeFileReader = createNodeFileReader();
 const defaultReadFile = (path: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> => nodeFileReader(path, 0, maxBytes, signal);
+
+/**
+ * Parse a bounded ATIF read into its validated step array (shared with the
+ * ADR-040 retirement tail scan): source ceiling, UTF-8, JSON, schema version,
+ * and the `session_id` pin. Steps themselves are judged by `checkStep` at the
+ * point each one is consumed. Throws `DevinSourceError` only.
+ */
+export function parseDevinDocument(data: Uint8Array, sessionId: string): unknown[] {
+  if (data.byteLength > DEVIN_SOURCE_MAX_BYTES) {
+    throw new DevinSourceError("source_exceeds_budget", { bytesAtLeast: data.byteLength, budget: DEVIN_SOURCE_MAX_BYTES });
+  }
+  let text: string;
+  try {
+    text = utf8.decode(data);
+  } catch {
+    throw malformed("invalid_utf8");
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(text);
+  } catch {
+    throw malformed("invalid_json");
+  }
+  if (!isRecord(document)) throw malformed("document_not_object");
+  if (typeof document.schema_version !== "string" || !ATIF_V1.test(document.schema_version)) {
+    throw malformed("schema_version_unsupported");
+  }
+  if (typeof document.session_id !== "string") throw malformed("session_id_invalid");
+  if (document.session_id !== sessionId) throw malformed("session_id_mismatch");
+  if (!Array.isArray(document.steps)) throw malformed("steps_not_array");
+  return document.steps;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -95,12 +127,12 @@ function own(value: Record<string, unknown>, field: string): boolean {
 }
 
 /** The session id is a filename key; a separator would escape the record dir. */
-function filenameSafe(sessionId: string): boolean {
+export function devinSessionFilenameSafe(sessionId: string): boolean {
   return sessionId !== "." && sessionId !== ".." && !/[\\/\0]/.test(sessionId);
 }
 
 /** SHA-256 over the canonical serialization of the first `count` steps. */
-function hashSteps(steps: unknown[], count: number): string {
+export function hashSteps(steps: unknown[], count: number): string {
   const hash = createHash("sha256");
   for (let index = 0; index < count; index += 1) {
     hash.update(JSON.stringify(steps[index]));
@@ -138,7 +170,7 @@ function malformedStep(step: number, reason: string): DevinSourceError {
  * `source_call_id`, a metrics object). Everything else rides through raw for
  * the digest builder; fields this reader does not consume are not validated.
  */
-function checkStep(step: unknown, index: number): Record<string, unknown> {
+export function checkStep(step: unknown, index: number): Record<string, unknown> {
   const stepId = index + 1;
   if (!isRecord(step)) throw malformedStep(stepId, "step_not_object");
   if (step.step_id !== stepId) throw malformedStep(stepId, "step_id_mismatch");
@@ -172,38 +204,15 @@ function checkStep(step: unknown, index: number): Record<string, unknown> {
  * storage seam's own error (seam → `source_unreadable`).
  */
 export function createDevinSessionReader(deps: DevinTraceDeps = {}): DevinSessionReader {
-  const dir = deps.transcriptsDir ?? defaultTranscriptsDir();
+  const dir = deps.transcriptsDir ?? devinTranscriptsDir();
   const read = deps.readFile ?? defaultReadFile;
   return async (sessionId, position, signal) => {
-    if (!filenameSafe(sessionId)) {
+    if (!devinSessionFilenameSafe(sessionId)) {
       throw new DevinSourceError("session_pointer_invalid", { reason: "id_not_filename_safe" });
     }
     const prior = parsePosition(position, sessionId);
     const data = await read(join(dir, `${sessionId}.json`), DEVIN_SOURCE_MAX_BYTES + 1, signal);
-    if (data.byteLength > DEVIN_SOURCE_MAX_BYTES) {
-      throw new DevinSourceError("source_exceeds_budget", { bytesAtLeast: data.byteLength, budget: DEVIN_SOURCE_MAX_BYTES });
-    }
-
-    let text: string;
-    try {
-      text = utf8.decode(data);
-    } catch {
-      throw malformed("invalid_utf8");
-    }
-    let document: unknown;
-    try {
-      document = JSON.parse(text);
-    } catch {
-      throw malformed("invalid_json");
-    }
-    if (!isRecord(document)) throw malformed("document_not_object");
-    if (typeof document.schema_version !== "string" || !ATIF_V1.test(document.schema_version)) {
-      throw malformed("schema_version_unsupported");
-    }
-    if (typeof document.session_id !== "string") throw malformed("session_id_invalid");
-    if (document.session_id !== sessionId) throw malformed("session_id_mismatch");
-    if (!Array.isArray(document.steps)) throw malformed("steps_not_array");
-    const steps: unknown[] = document.steps;
+    const steps = parseDevinDocument(data, sessionId);
 
     if (steps.length < prior.steps) {
       throw new DevinSourceError("source_rewritten", { reason: "steps_truncated" });

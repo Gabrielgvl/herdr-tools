@@ -170,6 +170,34 @@ export function devinComposer(view: string): DevinComposer | undefined {
   return { queued, inputEmpty, interior: stripAnsi(lines.slice(top + 1, bottom).join("\n")) };
 }
 
+/** The one pane read the composer parser is specified against: the visible screen with its SGR styling intact. */
+export const DEVIN_COMPOSER_READ_FLAGS = ["--source", "visible", "--format", "ansi"] as const;
+
+/** The exact `pane read` argv every composer proof issues — the flush cycles and the ADR-040 retirement guard alike. */
+export function devinComposerReadArgv(paneId: string): string[] {
+  return ["pane", "read", paneId, ...DEVIN_COMPOSER_READ_FLAGS];
+}
+
+/**
+ * The guarded parser entry point: `devinComposer` is only ever fed the result
+ * of the exact ansi visible read. A read issued under any other argv — the
+ * retirement sweep's `--source detection --format text` digest read strips
+ * the placeholder styling the queue proof depends on and would parse as
+ * `queued:false`, fail open — is refused here as unproven (`undefined`), as is
+ * a truncated frame that could hide a draft or a queue marker.
+ */
+export function devinComposerFromRead(argv: readonly string[], read: CliTextResult): DevinComposer | undefined {
+  if (argv.length !== 7 || argv[0] !== "pane" || argv[1] !== "read" || typeof argv[2] !== "string"
+    || DEVIN_COMPOSER_READ_FLAGS.some((flag, index) => argv[3 + index] !== flag)) return undefined;
+  return read.truncated ? undefined : devinComposer(read.value);
+}
+
+/** Issue the ansi visible read for `paneId` and parse it through the guarded entry point. */
+export async function readDevinComposer(cli: Pick<DevinQueueFlushCli, "runTextResult">, paneId: string, signal: AbortSignal): Promise<DevinComposer | undefined> {
+  const argv = devinComposerReadArgv(paneId);
+  return devinComposerFromRead(argv, await cli.runTextResult(argv, signal));
+}
+
 /**
  * A flush cycle is bounded overall, and the in-flight-turn wait inside it is
  * strictly shorter so the post-wait reads and key retain signal budget.
@@ -271,11 +299,7 @@ export function createDevinQueueFlush(deps: DevinQueueFlushDeps): DevinQueueFlus
   }
   let session: FlushSession | undefined;
 
-  const readComposer = async (paneId: string, signal: AbortSignal): Promise<DevinComposer | undefined> => {
-    const result = await deps.cli.runTextResult(["pane", "read", paneId, "--source", "visible", "--format", "ansi"], signal);
-    // A truncated frame can hide a draft or a queue marker: refuse, never guess.
-    return result.truncated ? undefined : devinComposer(result.value);
-  };
+  const readComposer = (paneId: string, signal: AbortSignal): Promise<DevinComposer | undefined> => readDevinComposer(deps.cli, paneId, signal);
 
   /**
    * The locked proof-and-key tail both Enter paths share. A second composer

@@ -181,6 +181,27 @@ export interface HandoffWorkspaceRecord {
   worktree?: string;
 }
 
+/** The structured native trace a child kind writes (ADR-040 amendment); AGY and unknown kinds have none. */
+export type HandoffTraceKind = "claude-jsonl" | "pi-jsonl" | "devin-session";
+
+/**
+ * Where the child's native trace ended when the accepted artifact's content
+ * was first validated (ADR-040 amendment, rollback evidence only). A JSONL
+ * trace records the verified-EOF offset and the SHA-256 of the ≤1 KiB before
+ * it; a Devin ATIF document records its step count and the prefix hash over
+ * those steps. Lane retirement proves the current trace still extends this
+ * prefix — a shorter trace or a prefix mismatch is a same-session rollback
+ * and refuses. The fingerprint is never used to find follow-ups.
+ */
+export interface HandoffTraceHistory {
+  kind: HandoffTraceKind;
+  /** The native session the position belongs to — a copy of `nativeSession` at validation. */
+  session: AgentSessionIdentity;
+  position:
+    | { path: string; offset: number; anchor: string }
+    | { session: string; steps: number; anchor: string };
+}
+
 /**
  * The versioned sidecar. Identity fields that only exist after agent start are
  * reserved as null at allocation and bound by the gate once the launched
@@ -211,7 +232,23 @@ export interface HandoffState {
   };
   nativeSession: { source: string; agent: string; kind: string; value: string } | null;
   lifecycle: { state: HandoffLifecycleState; watermark: { stateChangeSeq: number; revision: number } | null; detail?: string };
-  artifact: { path: string; sha256: string | null; bytes: number | null; version: number; status?: HandoffStatus };
+  artifact: {
+    path: string;
+    sha256: string | null;
+    bytes: number | null;
+    version: number;
+    status?: HandoffStatus;
+    /**
+     * The accepted artifact's write time, `Math.floor(stat.mtimeMs)` of the
+     * descriptor whose bytes hashed to `sha256`, recorded when that content
+     * was first validated and never refreshed by a byte-identical rewrite
+     * (ADR-040 amendment). Lane retirement refuses any user turn in the
+     * child's native trace timestamped at or after it.
+     */
+    mtimeMs?: number;
+    /** The native-history fingerprint captured alongside `mtimeMs`; absent when the capture failed. */
+    traceHistory?: HandoffTraceHistory;
+  };
   repair: { attempts: number; fence: { version: number; token: string } | null };
 }
 
@@ -637,6 +674,13 @@ const CHILD_KEYS = new Set(["agentName", "agentKind", "operatingPointId", "specL
 const ROUTE_KEYS = new Set(["tier", "operatingPointId", "policyRevision", "workload"]);
 const WORKSPACE_KEYS = new Set(["resolvedCwd", "worktree"]); // `worktree` stays accepted for old records; new launches never supply it
 const RESOLVED_MODEL_KEYS = new Set(["available", "model", "reason", "catalogRevision"]);
+const ARTIFACT_KEYS = new Set(["path", "sha256", "bytes", "version", "status", "mtimeMs", "traceHistory"]);
+const TRACE_HISTORY_KEYS = new Set(["kind", "session", "position"]);
+const TRACE_JSONL_POSITION_KEYS = new Set(["path", "offset", "anchor"]);
+const TRACE_DEVIN_POSITION_KEYS = new Set(["session", "steps", "anchor"]);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** The structured trace each child kind writes; a fingerprint of another kind is malformed for the record. */
+export const HANDOFF_TRACE_KINDS: Readonly<Record<string, HandoffTraceKind>> = { claude: "claude-jsonl", pi: "pi-jsonl", devin: "devin-session" };
 
 function validWorkload(value: unknown): value is WorkloadProfile {
   if (!stateRecord(value)) return false;
@@ -684,6 +728,38 @@ function validChild(value: unknown): value is HandoffState["child"] {
     && (value.workspace === undefined || validWorkspace(value.workspace));
 }
 
+function nonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function validTracePosition(value: unknown, kind: HandoffTraceKind): boolean {
+  if (!stateRecord(value) || typeof value.anchor !== "string" || !SHA256_HEX.test(value.anchor)) return false;
+  if (kind === "devin-session") {
+    return Object.keys(value).every((key) => TRACE_DEVIN_POSITION_KEYS.has(key)) && safeLine(value.session) && nonNegativeInteger(value.steps);
+  }
+  return Object.keys(value).every((key) => TRACE_JSONL_POSITION_KEYS.has(key)) && safeLine(value.path) && value.path.startsWith("/") && nonNegativeInteger(value.offset);
+}
+
+/** The persisted fingerprint must be whole, closed, and of the child's own kind — anything else fails the record. */
+function validTraceHistory(value: unknown, agentKind: string): value is HandoffTraceHistory {
+  if (!stateRecord(value) || !Object.keys(value).every((key) => TRACE_HISTORY_KEYS.has(key))) return false;
+  const kind = HANDOFF_TRACE_KINDS[agentKind];
+  return kind !== undefined && value.kind === kind && validSessionRecord(value.session) && validTracePosition(value.position, kind);
+}
+
+/**
+ * The artifact record stays loosely typed for its pre-amendment fields (older
+ * readers never keyed it), but the retirement anchor and fingerprint are
+ * validated strictly: a malformed anchor is a malformed sidecar, never a
+ * missing one — so it refuses as `sidecar_*`, not as a legacy lane.
+ */
+function validArtifact(value: unknown, agentKind: string): value is HandoffState["artifact"] {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => ARTIFACT_KEYS.has(key))
+    && (value.mtimeMs === undefined || nonNegativeInteger(value.mtimeMs))
+    && (value.traceHistory === undefined || validTraceHistory(value.traceHistory, agentKind));
+}
+
 function parseHandoffState(content: string, run: HandoffAllocation): HandoffState {
   let value: unknown;
   try {
@@ -695,8 +771,8 @@ function parseHandoffState(content: string, run: HandoffAllocation): HandoffStat
   // v2 records only: a v1 sidecar predates recovery lineage and is never
   // reinterpreted. The endpoint pin binds the record to this run's namespace.
   if (!stateRecord(state) || state.v !== 2 || state.runId !== run.runId || state.endpoint !== run.endpoint
-    || !stateRecord(state.manager) || !stateRecord(state.lifecycle) || !stateRecord(state.artifact) || !stateRecord(state.repair)
-    || !validChild(state.child)) {
+    || !stateRecord(state.manager) || !stateRecord(state.lifecycle) || !stateRecord(state.repair)
+    || !validChild(state.child) || !validArtifact(state.artifact, state.child.agentKind)) {
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff state is malformed", { path: safePath(run.statePath) });
   }
   return state;
@@ -931,6 +1007,8 @@ export interface HandoffArtifact {
   sections: Record<(typeof HANDOFF_HEADINGS)[number], string>;
   bytes: number;
   sha256: string;
+  /** `Math.floor(stat.mtimeMs)` of the descriptor these bytes were read from — the retirement anchor candidate. */
+  mtimeMs: number;
 }
 
 function invalid(reason: string): HandoffError {
@@ -942,7 +1020,7 @@ function invalid(reason: string): HandoffError {
  * the first heading, exactly the six headings in order, non-empty non-placeholder
  * bodies, an enumerated status, and a `None`-or-bullet Changes list.
  */
-export function parseHandoffArtifact(content: string, expectedMarker: string): Omit<HandoffArtifact, "bytes" | "sha256"> {
+export function parseHandoffArtifact(content: string, expectedMarker: string): Omit<HandoffArtifact, "bytes" | "sha256" | "mtimeMs"> {
   if (content.includes("\0")) throw invalid("nul_byte");
   const lines = content.split("\n");
   const markerIndexes = lines.flatMap((line, index) => MARKER_PATTERN.test(line.trim()) ? [index] : []);
@@ -1012,7 +1090,8 @@ export async function readHandoffArtifact(run: HandoffAllocation): Promise<Hando
     if (bytesRead > HANDOFF_MAX_BYTES) throw new HandoffError("HANDOFF_ARTIFACT_OVERSIZED", "Handoff artifact exceeds the accepted bound", { bytes: bytesRead, limit: HANDOFF_MAX_BYTES });
     const content = buffer.subarray(0, bytesRead).toString("utf8");
     const parsed = parseHandoffArtifact(content, run.marker);
-    return { ...parsed, bytes: bytesRead, sha256: createHash("sha256").update(content, "utf8").digest("hex") };
+    // Floor, never round: the anchor must never be later than the true write.
+    return { ...parsed, bytes: bytesRead, sha256: createHash("sha256").update(content, "utf8").digest("hex"), mtimeMs: Math.floor(stat.mtimeMs) };
   } finally {
     await handle.close().catch(() => undefined);
   }

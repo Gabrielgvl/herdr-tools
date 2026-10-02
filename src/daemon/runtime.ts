@@ -40,6 +40,7 @@ import { createOwnership } from "./ownership.js";
 import type { Mailbox, MailboxEventWriter } from "./mailbox.js";
 import type { DaemonNamespace } from "./namespace.js";
 import type { LaneRetirer } from "./retire.js";
+import { captureTraceHistory } from "../supervision/trace-tail.js";
 import { DAEMON_REASON_TOKEN, DaemonRequestError } from "./protocol.js";
 import type { DaemonRequestHandler } from "./server.js";
 
@@ -111,7 +112,12 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
   queueFlush.begin();
   const wiring = deps.wire?.({ cli, queueFlush }) ?? {};
   const jobs = wiring.jobs ?? new JobRegistry();
-  const handoffs = createHandoffGate();
+  const handoffs = createHandoffGate({
+    // ADR-040 amendment: the native-history fingerprint persisted beside the
+    // acceptance anchor; the lane retirer proves the trace still extends it.
+    traceHistory: (identity, workspace, signal) => captureTraceHistory(identity, workspace, signal),
+    ...(deps.log === undefined ? {} : { log: deps.log }),
+  });
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),

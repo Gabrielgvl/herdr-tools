@@ -113,6 +113,17 @@ async function globalUnreadCount(namespace: DaemonNamespace): Promise<number> {
 }
 
 describe("event file discipline (§7 no-clobber write)", () => {
+  it("persists the bounded provider_limit payload and refuses a malformed one", async () => {
+    const { mailbox } = await fixture({ ownership: fixedOwner(mgrA) });
+    const limit = { operatingPointId: "devin:swe-2-max", retryNotBefore: "2026-10-02T01:59:04.421Z" };
+    const result = await mailbox.writeRunEvent(runEvent("run-1", { kind: "provider_limit", limit }));
+    if (!result.persisted) throw new Error("expected persist");
+    expect(await mailbox.read(mgrA, result.eventId)).toMatchObject({ kind: "provider_limit", limit });
+    for (const bad of [{ operatingPointId: "" }, { operatingPointId: "p", retryNotBefore: "not-a-time" }]) {
+      await expect(mailbox.writeRunEvent(runEvent("run-1", { kind: "provider_limit", limit: bad }))).rejects.toThrow(/limit is malformed/);
+    }
+  });
+
   it("writes one 0600 file per event under 0700 dirs with a sortable ID and the typed body", async () => {
     const { mailbox, namespace } = await fixture({ ownership: fixedOwner(mgrA) });
     const result = await mailbox.writeRunEvent(runEvent("run-1", {

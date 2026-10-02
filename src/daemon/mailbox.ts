@@ -133,6 +133,12 @@ export interface MailboxHandoff {
   artifactSha256?: string;
 }
 
+/** The bounded `provider_limit` payload: the provider's own reset instant and the limited operating point. */
+export interface MailboxProviderLimit {
+  operatingPointId: string;
+  retryNotBefore?: string;
+}
+
 /** The run-scoped event body (spec §7). */
 export interface MailboxRunEvent {
   id: string;
@@ -143,6 +149,7 @@ export interface MailboxRunEvent {
   childIdentity?: MailboxChildIdentity;
   decision?: MailboxDecision;
   handoff?: MailboxHandoff;
+  limit?: MailboxProviderLimit;
   actions: string[];
 }
 
@@ -166,6 +173,7 @@ export interface MailboxRunEventInput {
   childIdentity?: MailboxChildIdentity;
   decision?: MailboxDecision;
   handoff?: MailboxHandoff;
+  limit?: MailboxProviderLimit;
   actions?: string[];
   /** Pre-minted event ID for journaled replays (N2.4); omitted mints a fresh one. */
   id?: string;
@@ -294,6 +302,11 @@ function validHandoff(value: MailboxHandoff): boolean {
   return boundedText(value.state, 64) && (value.artifactSha256 === undefined || boundedText(value.artifactSha256, 128));
 }
 
+function validLimit(value: MailboxProviderLimit): boolean {
+  return boundedText(value.operatingPointId, 128)
+    && (value.retryNotBefore === undefined || (boundedText(value.retryNotBefore, 64) && Number.isFinite(Date.parse(value.retryNotBefore))));
+}
+
 function assertRunEventInput(input: MailboxRunEventInput): void {
   if (!boundedText(input.kind, 64) || !boundedText(input.runId, 200) || !boundedText(input.jobId, 200)) {
     throw invalid("run event identity fields are malformed");
@@ -302,6 +315,7 @@ function assertRunEventInput(input: MailboxRunEventInput): void {
   if (!Array.isArray(actions) || !actions.every((action) => boundedText(action, 256))) throw invalid("run event actions are malformed");
   if (input.decision !== undefined && !validDecision(input.decision)) throw invalid("run event decision is malformed");
   if (input.handoff !== undefined && !validHandoff(input.handoff)) throw invalid("run event handoff is malformed");
+  if (input.limit !== undefined && !validLimit(input.limit)) throw invalid("run event limit is malformed");
 }
 
 function assertGapEventInput(gap: MailboxGapEventInput): void {
@@ -753,6 +767,7 @@ export function createMailbox(options: MailboxOptions): Mailbox {
       ...(input.childIdentity === undefined ? {} : { childIdentity: input.childIdentity }),
       ...(input.decision === undefined ? {} : { decision: input.decision }),
       ...(input.handoff === undefined ? {} : { handoff: input.handoff }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
       actions: input.actions ?? [],
     };
     return { eventId, data: serialize(body) };

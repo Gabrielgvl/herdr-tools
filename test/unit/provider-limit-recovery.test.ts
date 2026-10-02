@@ -408,6 +408,24 @@ describe("provider-limit auto-recovery", () => {
     expect(provenance.task).toMatchObject({ objective: TASK.objective, retention: "keep", recoveryOf: dead.handoff!.allocation.runId });
   });
 
+  it("never auto-recovers a follow-up cycle, even when its own window reads as zero progress (F5)", async () => {
+    const harness = makeCli();
+    const supervision = stubSupervision();
+    const recorder = vi.fn(async () => undefined);
+    const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: RESET_ISO, zeroProgressProven: true }));
+    await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs: allocator(), availabilityFailureRecorder: recorder, claudeQuotaReader: quota }), TASK);
+    const child = supervision.bound[0]!;
+    // A follow-up window (the previous cycle's end) proves nothing about the
+    // task's earlier progress: detect, cool, wake — and leave the pane alone.
+    const signal = await supervision.completionSignals[0]!(child.identity, Date.now() - 1_000);
+    expect(signal).toEqual({ cooldownRecorded: true, retryNotBefore: RESET_ISO });
+    expect(quota).toHaveBeenCalledWith(child.identity.agentSession, repoRoot, expect.any(Number));
+    expect(recorder).toHaveBeenCalledTimes(1);
+    expect(harness.starts()).toBe(1);
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "close")).toEqual([]);
+    expect(harness.live()).toHaveLength(1);
+  });
+
   it("keeps the manual contract when zero progress is not provable, and records the 15-minute default when no reset signal exists", async () => {
     const harness = makeCli();
     const supervision = stubSupervision();

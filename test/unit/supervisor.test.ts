@@ -9,6 +9,7 @@ import { ReviewerFailure } from "../../src/reviewer.js";
 import type { ReconciliationFailureReason, SupervisionEvent } from "../../src/supervision/events.js";
 import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type ProvisionalSupervisionBinding, type SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
+import type { MailboxEventWriter, MailboxRunEventInput } from "../../src/daemon/mailbox.js";
 import { createSelfCloseTracker, type SelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
 import { reviewLogPaths, ReviewLogError, type SupervisionLogEntry, type SupervisionLogRecord, type SupervisionReviewLogEntry } from "../../src/supervision/review-log.js";
@@ -138,6 +139,10 @@ interface HarnessOptions {
   evidenceScanner?: EvidenceScanner;
   /** Wire the bounded diagnostic sink into the deps and collect its lines. */
   log?: boolean;
+  /** The owner-mailbox writer seam; the default harness persists nothing. */
+  eventWriter?: MailboxEventWriter;
+  /** The supervisor clock; the default is fixed at 1 000. */
+  clock?: { now(): number };
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -192,7 +197,8 @@ function harness(options: HarnessOptions = {}): Harness {
     ...(options.reviewLog === "default" ? {} : { reviewLog: options.reviewLog ?? (async (entry: SupervisionLogEntry) => { logged.push(entry); }) }),
     ...(options.reviewLogRoot === undefined ? {} : { reviewLogRoot: options.reviewLogRoot }),
     cadenceMs: options.cadenceMs ?? 300_000,
-    clock: { now: () => 1_000 },
+    clock: options.clock ?? { now: () => 1_000 },
+    ...(options.eventWriter === undefined ? {} : { eventWriter: options.eventWriter }),
     scheduler,
     ...(options.selfClose ? { selfClose: options.selfClose } : {}),
     ...(options.handoffs ? { handoffs: options.handoffs } : {}),
@@ -328,6 +334,50 @@ describe("supervisor binding", () => {
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  });
+
+  it("never reads a limited cycle as a completion on a later terminal flap (F3)", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    h.supervisor.onCompletionSignal(vi.fn().mockResolvedValue({ cooldownRecorded: true }));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["provider_limit"]));
+    // idle → done without an intervening working transition is the same stalled cycle.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 7 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 8 })));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(types(h.wakes)).toEqual(["provider_limit"]);
+  });
+
+  it("holds the completion through settlement's final reads and releases only a clean cycle (F2)", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([], [])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    // The first read misses the native record; the exit's final read finds it.
+    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true, retryNotBefore: "2026-10-02T01:59:04.421Z" });
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
+    expect(types(h.wakes)).toEqual([]);
+    await h.supervisor.onEvent(thinEvent("pane_exited"));
+    expect(h.supervisor.view().state).toBe("settled");
+    expect(types(h.wakes)).toEqual(["pane_closed", "provider_limit"]);
+  });
+
+  it("anchors each cycle's window at the previous terminal fold, never at a delayed working fold (F4)", async () => {
+    let nowMs = 10_000;
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])], clock: { now: () => nowMs } });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValue(false);
+    h.supervisor.onCompletionSignal(signal);
+    // The first cycle's window is the launch's own prompt anchor.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith(identity, undefined));
+    nowMs = 20_000;
+    // The follow-up's working fold lands late — after the provider could have logged the stall.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7 })));
+    nowMs = 30_000;
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 8 })));
+    await vi.waitFor(() => expect(signal).toHaveBeenLastCalledWith(identity, 10_000));
   });
 
   it("records a late native quota signal before settling an exited child with no idle observation", async () => {
@@ -3932,6 +3982,83 @@ describe("managed handoff evaluation", () => {
     }
   });
 
+  /** A capturing owner-mailbox writer. */
+  function capturingWriter(): { writer: MailboxEventWriter; written: MailboxRunEventInput[] } {
+    const written: MailboxRunEventInput[] = [];
+    return { written, writer: { writeRunEvent: async (input) => { written.push(input); return { persisted: true, eventId: `evt-${written.length}`, path: "/dev/null" }; } } };
+  }
+
+  it("delivers exactly one completion wake and mailbox event when the artifact validates before the bounded reads finish (F7)", async () => {
+    const mailbox = capturingWriter();
+    const gate = createHandoffGate();
+    const h = harness({ snapshots: [workingOrigin()], handoffs: gate, eventWriter: mailbox.writer, log: true });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
+    const allocation = await managedAllocation();
+    await gate.bind(allocation, identity);
+    try {
+      const signal = vi.fn().mockResolvedValue(false);
+      h.supervisor.onCompletionSignal(signal);
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      // Acceptance and retirement land behind the first read, before the retries clear the cycle.
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired"))).toBe(true));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["work_cycle_completed"]));
+      expect(mailbox.written.map((input) => input.kind)).toEqual(["work_cycle_completed"]);
+      // Post-handoff flaps stay bookkeeping.
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, stateChangeSeq: 7 })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(6), { timeout: 2000 });
+      await sleep(20);
+      expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+      expect(mailbox.written).toHaveLength(1);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers a limit decided after acceptance with its reset in the mailbox body, and no completion (F1, F6)", async () => {
+    const mailbox = capturingWriter();
+    const gate = createHandoffGate();
+    const h = harness({ snapshots: [workingOrigin()], handoffs: gate, eventWriter: mailbox.writer, log: true });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
+    const allocation = await managedAllocation();
+    await gate.bind(allocation, identity);
+    try {
+      const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true, retryNotBefore: "2026-10-02T01:59:04.421Z" });
+      h.supervisor.onCompletionSignal(signal);
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired"))).toBe(true));
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["provider_limit"]));
+      await sleep(20);
+      expect(types(h.wakes)).toEqual(["provider_limit"]);
+      expect(mailbox.written).toHaveLength(1);
+      expect(mailbox.written[0]).toMatchObject({ kind: "provider_limit", runId: allocation.runId, limit: { operatingPointId: "worker-pi", retryNotBefore: "2026-10-02T01:59:04.421Z" } });
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle).toMatchObject({ state: "handed_off", detail: "provider_limit" }));
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the provider_limit detail when settlement accepts the artifact of a limited cycle (F8)", async () => {
+    const { h, allocation } = await managed({ snapshots: [workingOrigin(), snapshot([], [])] });
+    try {
+      // No terminal status is ever observed: the settle-time final read finds the limit.
+      h.supervisor.onCompletionSignal(vi.fn().mockResolvedValue({ cooldownRecorded: true }));
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(thinEvent("pane_exited"));
+      expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
+      expect((await readHandoffState(allocation)).lifecycle).toMatchObject({ state: "handed_off", detail: "provider_limit" });
+      expect(types(h.wakes)).toEqual(["pane_closed", "provider_limit"]);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("detects a provider limit in a follow-up cycle: provider_limit instead of work_cycle_completed, then a failed run on close", async () => {
     const { h, allocation } = await managed({ snapshots: [workingOrigin(), snapshot([], [])] });
     try {
@@ -3982,7 +4109,7 @@ describe("managed handoff evaluation", () => {
       // Settlement never swallows a held wake.
       await h.supervisor.onEvent(thinEvent("pane_closed"));
       expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
-      expect(types(h.wakes)).toEqual(["work_cycle_completed", "work_cycle_completed", "pane_closed"]);
+      expect(types(h.wakes)).toEqual(["work_cycle_completed", "pane_closed", "work_cycle_completed"]);
       expect((await readHandoffState(allocation)).lifecycle).toMatchObject({ state: "cancelled" });
     } finally {
       h.supervisor.shutdown();

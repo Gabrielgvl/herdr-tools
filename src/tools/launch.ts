@@ -2908,6 +2908,12 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           }
         };
         reservation!.onCompletionSignal(async (identity, cycleStartedMs) => {
+          // The first cycle's window is the prompt itself; a follow-up's is the
+          // previous cycle's end. Only the first window can prove zero task
+          // progress for the whole task, so only it can authorize the
+          // automatic close-and-relaunch; a follow-up detects, cools and
+          // wakes, and the manager decides.
+          const initialCycle = cycleStartedMs === undefined;
           const quota = await readQuota(identity, Math.max(promptSubmissionWallMs, cycleStartedMs ?? 0));
           if (quota === false) return false;
           let cooldownRecorded: boolean;
@@ -2918,7 +2924,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           } catch {
             cooldownRecorded = false;
           }
-          const autoRecovery = await providerLimitRecovery(identity, quota).catch((): ProviderLimitRecoveryEvidence => ({ outcome: "failed", code: "RECOVERY_FAILED" }));
+          const autoRecovery = initialCycle
+            ? await providerLimitRecovery(identity, quota).catch((): ProviderLimitRecoveryEvidence => ({ outcome: "failed", code: "RECOVERY_FAILED" }))
+            : undefined;
           return {
             cooldownRecorded,
             ...(quota.retryNotBefore === null ? {} : { retryNotBefore: quota.retryNotBefore }),

@@ -15,7 +15,7 @@ import { findSessionPane } from "../messages/prompt-target.js";
 import { renderHandoffContract, type HandoffAllocation } from "../handoff.js";
 import { handoffGateMatches, type HandoffGate, type HandoffInspection, type HandoffRun, type HandoffValidation } from "../handoff-gate.js";
 import type { IdleHintSink } from "../daemon/hints.js";
-import type { MailboxDecision, MailboxEventWriter } from "../daemon/mailbox.js";
+import type { MailboxDecision, MailboxEventWriter, MailboxProviderLimit } from "../daemon/mailbox.js";
 import type { HerdrSnapshot } from "../targets.js";
 import {
   BoundedHistory,
@@ -397,8 +397,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private completionLogDegraded = false;
   private completionAttempts = 0;
   private completionRetry?: NodeJS.Timeout;
-  /** When the current cycle's working transition was folded — the completion signal's evidence window. */
+  /**
+   * The current cycle's evidence window: the fold time of the previous
+   * cycle's terminal transition, undefined for the first cycle (the launch
+   * anchors that one at prompt submission). A working fold can land after
+   * the provider already logged the stall, so the window never starts there;
+   * the previous cycle's own stall precedes its terminal transition.
+   */
   private cycleStartedMs: number | undefined;
+  /** The fold time of the last idle/done/blocked transition — the next cycle's window start. */
+  private lastTerminalFoldMs: number | undefined;
+  /**
+   * Whether the current cycle's verdict — its completion or its limit — is
+   * owed to the manager: true unless it is post-handoff bookkeeping (the
+   * supervisor retired and no follow-up reopened the cycle). Fixed when the
+   * cycle's terminal transition folds, so an acceptance that retires the
+   * supervisor before the bounded reads finish cannot silence the verdict.
+   */
+  private cycleDeliverable = true;
   /**
    * A `work_cycle_completed` held back while the bounded completion-signal
    * reads run: a cycle the provider limited is a `provider_limit`, not a
@@ -924,15 +940,16 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       const managed = this.managedRun();
       /* c8 ignore next -- a published binding always carries its managed run. */
       const runId = managed?.run.runId;
+      /* c8 ignore next -- a bound supervisor selected its operating point before the signal could register. */
+      const operatingPointId = this.selectedOperatingPointId ?? this.deps.child.operatingPointId;
       this.emit("provider_limit", "child hit a typed provider limit after start; close it before recovery", {
         code: "PROVIDER_LIMIT",
-        /* c8 ignore next -- a bound supervisor selected its operating point before the signal could register. */
-        operatingPointId: this.selectedOperatingPointId ?? this.deps.child.operatingPointId,
+        operatingPointId,
         /* c8 ignore next -- the managed run check above keeps a bound supervisor's runId defined. */
         ...(runId === undefined ? {} : { runId }),
         ...(result.retryNotBefore === undefined ? {} : { retryNotBefore: result.retryNotBefore }),
         ...(result.autoRecovery === undefined ? {} : autoRecoveryDetails(result.autoRecovery)),
-      });
+      }, undefined, { deliverable: this.cycleDeliverable, limit: { operatingPointId, ...(result.retryNotBefore === undefined ? {} : { retryNotBefore: result.retryNotBefore }) } });
       if (!result.cooldownRecorded && !this.completionLogDegraded) {
         this.completionLogDegraded = true;
         this.emit("evidence_gap", "Claude quota cooldown could not be recorded", { reason: "availability_record_unavailable" });
@@ -980,8 +997,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const pending = this.pendingCycleEvent;
     if (pending === undefined) return;
     this.pendingCycleEvent = undefined;
-    this.emit("work_cycle_completed", pending.summary, pending.details);
+    this.emit("work_cycle_completed", pending.summary, pending.details, undefined, { deliverable: this.cycleDeliverable });
   }
+
 
   /** Resolve when the supervisor settles. This is the supervisor job's run body. */
   async run(): Promise<Settlement> {
@@ -1762,7 +1780,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // previously accepted handoff version is stale from this point on, and
       // so is any provider limit recorded for the previous cycle.
       this.completionRecorded = false;
-      this.cycleStartedMs = this.deps.clock.now();
+      this.cycleStartedMs = this.lastTerminalFoldMs;
       const managed = this.managedRun();
       if (managed !== undefined) {
         managed.gate.beginCycle(managed.run);
@@ -1774,6 +1792,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     this.enterStatus(next);
     if (next === "idle" || next === "done" || next === "blocked") {
+      this.lastTerminalFoldMs = this.deps.clock.now();
+      // Fixed here, before the handoff evaluation queued below can accept the
+      // artifact, retire the supervisor, and close the cycle.
+      this.cycleDeliverable = !this.retired || this.managedRun()?.run.cycleOpen === true;
       // A managed terminal observation is not acceptance by itself. The
       // current-cycle artifact check runs on the mutation chain behind the
       // fold that produced it, so it sees every earlier transition first.
@@ -1786,9 +1808,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.publish(`child ${from} → ${next}`);
       return;
     }
-    if (material === "work_cycle_completed" && this.completionSignal !== undefined && !this.completionRecorded) {
-      // The bounded completion reads decide whether this cycle completed or
-      // hit a provider limit; the wake follows that verdict.
+    if (material === "work_cycle_completed" && this.completionSignal !== undefined) {
+      // A cycle already recorded as limited never reads as a completion,
+      // whatever later terminal flaps it shows; otherwise the bounded
+      // completion reads decide, and the wake follows that verdict.
+      if (this.completionRecorded) return;
       this.pendingCycleEvent = { summary: `child ${from} → ${next}`, details: { from, to: next, revision } };
       return;
     }
@@ -2266,16 +2290,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return { agentName: provisional.identity.agentName, agentKind: provisional.identity.agentKind, paneId: provisional.identity.paneId };
   }
 
-  private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>, decision?: MailboxDecision): SupervisionEvent {
+  /**
+   * A cycle verdict decided after its terminal fold — the held completion or
+   * a provider limit — carries the eligibility fixed at that fold
+   * (`deliverable`), and a limit carries its bounded mailbox payload.
+   */
+  private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>, decision?: MailboxDecision, verdict?: { deliverable: boolean; limit?: MailboxProviderLimit }): SupervisionEvent {
     const event = this.log.record(type, this.deps.clock.now(), summary, details);
     this.publish(`${type}: ${summary}`);
     // After the run hands off, idle/done flaps are bookkeeping: the local
     // history still records for `view()`/diagnosis, but no mailbox write,
     // owner wake, or hint follows. `blocked` still emits — a stuck child is
     // never noise — and so does anything in a reopened artifact cycle, where
-    // the child demonstrably worked past the accepted version.
-    if (this.retired && type !== "blocked" && this.managedRun()?.run.cycleOpen !== true) return event;
-    this.persistEmittedEvent(event, decision);
+    // the child demonstrably worked past the accepted version. A cycle
+    // verdict keeps the eligibility its own terminal fold fixed: an
+    // acceptance that retired the supervisor in between is not bookkeeping.
+    const deliverable = verdict === undefined ? !this.retired || type === "blocked" || this.managedRun()?.run.cycleOpen === true : verdict.deliverable;
+    if (!deliverable) return event;
+    this.persistEmittedEvent(event, decision, verdict?.limit);
     // The wake payload is fixed at emission: a deferred suppression decision
     // must never re-read an identity the settle in between may have dropped.
     const wake: SupervisionWake = {
@@ -2298,7 +2330,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * as persisted — it surfaces `persistenceFailed` with the event ID on the
    * job view (progress details) for `herdr_status` to aggregate.
    */
-  private persistEmittedEvent(event: SupervisionEvent, decision?: MailboxDecision): void {
+  private persistEmittedEvent(event: SupervisionEvent, decision?: MailboxDecision, limit?: MailboxProviderLimit): void {
     const writer = this.deps.eventWriter;
     if (writer === undefined) return;
     const managed = this.managedRun();
@@ -2311,6 +2343,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       childIdentity: { agentName: child.agentName, agentKind: child.agentKind, paneId: child.paneId },
       handoff: { state: managed.run.lifecycle },
       ...(decision === undefined ? {} : { decision }),
+      ...(limit === undefined ? {} : { limit }),
       actions: [],
     })).then(
       (result) => {
@@ -2356,7 +2389,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async settleWithEvent(type: SupervisionEventType, outcome: SupervisionResult, trigger: string, summary: string): Promise<void> {
-    this.flushPendingCycleEvent();
     if (type === "pane_closed" && this.deps.selfClose !== undefined) {
       // A manager-requested close is successful bookkeeping, not an event for
       // that same manager. Wait for the bounded close proof before deciding so
@@ -2381,7 +2413,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });
     // Exit, replacement or lost continuity may skip idle/done entirely. Check
-    // the original bound session before dropping it, then allow one brief flush.
+    // the original bound session before dropping it, then allow one brief
+    // flush; a held completion is released only if those reads stay negative.
     if ((outcome === "released" || outcome === "identity_replaced" || outcome === "identity_lost")
       && this.completionSignal !== undefined && !this.completionRecorded && this.identity !== undefined) {
       await this.recordCompletionSignal();
@@ -2530,7 +2563,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       }
     }
     try {
-      if (handedOff) await managed.gate.recordOutcome(managed.run, "handed_off", reason);
+      // An accepted artifact keeps its acceptance, but a limit recorded for
+      // the exiting cycle stays on it — as evaluateHandoff keeps it.
+      if (handedOff) await managed.gate.recordOutcome(managed.run, "handed_off", limited ? "provider_limit" : reason);
       else if (limited) await managed.gate.recordOutcome(managed.run, "failed", "provider_limit");
       else await managed.gate.recordOutcome(managed.run, "cancelled", reason);
     } catch {

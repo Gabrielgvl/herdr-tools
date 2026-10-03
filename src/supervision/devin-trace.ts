@@ -37,6 +37,11 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  createDevinSessionsDbReader,
+  DevinSessionsDbFallback,
+  type DevinSessionsDbDeps,
+} from "./devin-sessions-db.js";
+import {
   createNodeFileReader,
   DevinSourceError,
   TRACE_WINDOW_MAX_BYTES,
@@ -53,6 +58,12 @@ export interface DevinTraceDeps {
   transcriptsDir?: string;
   /** Read at most `maxBytes` from the start of one source file. */
   readFile?: (path: string, maxBytes: number, signal: AbortSignal) => Promise<Uint8Array>;
+  /**
+   * The live `sessions.db` backend, on by default: `undefined`/a deps object
+   * builds it, a `DevinSessionReader` is used as-is (tests), and `false`
+   * leaves the reader transcript-only — the pre-live-store behaviour.
+   */
+  sessionsDb?: DevinSessionsDbDeps | DevinSessionReader | false;
 }
 
 /**
@@ -152,6 +163,11 @@ function parsePosition(position: unknown, sessionId: string): DevinCursor {
   if (position.session !== sessionId) throw cursorMalformed("session_mismatch");
   if (!Number.isSafeInteger(position.steps) || (position.steps as number) < 0) throw cursorMalformed("steps_invalid");
   if (typeof position.anchor !== "string" || !HEX_64.test(position.anchor)) throw cursorMalformed("anchor_invalid");
+  // A store-minted cursor is never interpreted by this backend — the two
+  // anchors are not interchangeable (the live anchor covers chain nodes, not
+  // transcript steps). The router keeps store positions on the store; one
+  // that lands here anyway is foreign, not malformed-looking transcript data.
+  if (own(position, "db")) throw cursorMalformed("db_position_foreign");
   return { session: sessionId, steps: position.steps as number, anchor: position.anchor };
 }
 
@@ -206,10 +222,7 @@ export function checkStep(step: unknown, index: number): Record<string, unknown>
 export function createDevinSessionReader(deps: DevinTraceDeps = {}): DevinSessionReader {
   const dir = deps.transcriptsDir ?? devinTranscriptsDir();
   const read = deps.readFile ?? defaultReadFile;
-  return async (sessionId, position, signal) => {
-    if (!devinSessionFilenameSafe(sessionId)) {
-      throw new DevinSourceError("session_pointer_invalid", { reason: "id_not_filename_safe" });
-    }
+  const transcript: DevinSessionReader = async (sessionId, position, signal) => {
     const prior = parsePosition(position, sessionId);
     const data = await read(join(dir, `${sessionId}.json`), DEVIN_SOURCE_MAX_BYTES + 1, signal);
     const steps = parseDevinDocument(data, sessionId);
@@ -244,5 +257,29 @@ export function createDevinSessionReader(deps: DevinTraceDeps = {}): DevinSessio
       emit += 1;
     }
     return { position: { session: sessionId, steps: emit, anchor: hashSteps(steps, emit) }, events };
+  };
+
+  const store: DevinSessionReader | undefined =
+    deps.sessionsDb === false ? undefined : typeof deps.sessionsDb === "function" ? deps.sessionsDb : createDevinSessionsDbReader(deps.sessionsDb);
+  return async (sessionId, position, signal) => {
+    if (!devinSessionFilenameSafe(sessionId)) {
+      throw new DevinSourceError("session_pointer_invalid", { reason: "id_not_filename_safe" });
+    }
+    // The backend is sticky per cursor: a store-minted position stays on the
+    // store (its failures never downgrade to the transcript), and a
+    // transcript position never upgrades. An undefined position tries the
+    // store first — a `DevinSessionsDbFallback` (store absent, import
+    // failure, gate closed, or no such session) selects the transcript
+    // reader, exactly today's behaviour; a transient throw mints nothing.
+    if (isRecord(position) && own(position, "db")) {
+      return store === undefined ? transcript(sessionId, position, signal) : store(sessionId, position, signal);
+    }
+    if (position !== undefined || store === undefined) return transcript(sessionId, position, signal);
+    try {
+      return await store(sessionId, undefined, signal);
+    } catch (error) {
+      if (error instanceof DevinSessionsDbFallback) return transcript(sessionId, position, signal);
+      throw error;
+    }
   };
 }

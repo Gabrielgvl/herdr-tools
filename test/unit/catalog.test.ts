@@ -106,8 +106,8 @@ describe("catalog", () => {
     expect(catalog.tierChains).toEqual({
       utility: ["pi:openai-codex/gpt-6-luna:low", "devin:swe-1-7-lightning-medium"],
       economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
-      standard: ["devin:swe-2-high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6.1-sol:high", "agy:gemini-3.8-flash-low"],
-      strong: ["devin:swe-2-max", "claude:opus:high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high", "pi:openai-codex/gpt-6.1-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
+      standard: ["devin:swe-2-high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6.1-sol:high", "agy:gemini-3.8-flash-low", "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high"],
+      strong: ["devin:swe-2-max", "claude:opus:high", "pi:openai-codex/gpt-6.1-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high"],
       frontier: ["claude:opus:xhigh", "pi:openai-codex/gpt-6-astra:xhigh", "claude:fable:low", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
       max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "claude:opus:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });

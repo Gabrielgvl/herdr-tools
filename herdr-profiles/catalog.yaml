@@ -294,20 +294,24 @@ tierChains:
     - pi:openai-codex/gpt-6-luna:max
     - pi:zai/glm-5.3-flash:low
     - claude:sonnet:low
+  # MiMo sits last in standard and strong while the Xiaomi token plan is
+  # exhausted (2026-10-03: launches got 429 "quota exhausted" and pi fell back
+  # to Codex). The catalog has no quota source for that plan, so availability
+  # cannot exclude it. Restore its slots when the plan resets.
   standard:
     - devin:swe-2-high
-    - pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high
     - claude:opus:low
     - pi:zai/glm-5.3-flash:high
     - pi:openai-codex/gpt-6.1-sol:high
     - agy:gemini-3.8-flash-low
+    - pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high
   strong:
     - devin:swe-2-max
     - claude:opus:high
-    - pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high
     - pi:openai-codex/gpt-6.1-sol:xhigh
     - pi:zai/glm-5.3-flash:max
     - agy:gemini-3.8-flash-high
+    - pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high
   frontier:
     - claude:opus:xhigh
     - pi:openai-codex/gpt-6-astra:xhigh

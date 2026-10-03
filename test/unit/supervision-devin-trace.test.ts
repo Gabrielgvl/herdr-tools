@@ -80,7 +80,7 @@ function source(map: Record<string, Uint8Array>): TraceSource {
 }
 
 function reader(map: Record<string, Uint8Array>): DevinSessionReader {
-  return createDevinSessionReader({ transcriptsDir: DIR, readFile: files(map) });
+  return createDevinSessionReader({ transcriptsDir: DIR, readFile: files(map), sessionsDb: false });
 }
 
 const signal = () => new AbortController().signal;
@@ -231,7 +231,7 @@ describe("devin session reader", () => {
     const dir = await mkdtemp(join(tmpdir(), "herdr-devin-oversized-"));
     dirs.push(dir);
     await writeFile(join(dir, "sess-1.json"), new Uint8Array(DEVIN_SOURCE_MAX_BYTES + 1));
-    const window = await createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir }) }).read(identity(), undefined, signal());
+    const window = await createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir, sessionsDb: false }) }).read(identity(), undefined, signal());
     expect(window.typedFailure).toEqual({
       kind: "source_exceeds_budget",
       detail: { bytesAtLeast: DEVIN_SOURCE_MAX_BYTES + 1, budget: DEVIN_SOURCE_MAX_BYTES },
@@ -367,7 +367,7 @@ describe("devin session reader", () => {
       controller.abort();
       throw Object.assign(new Error("aborted"), { code: "ABORT_ERR" });
     };
-    const trace = createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: DIR, readFile }) });
+    const trace = createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: DIR, readFile, sessionsDb: false }) });
     const window = await trace.read(identity(), undefined, controller.signal);
     expect(window.typedFailure).toMatchObject({ kind: "aborted" });
   });
@@ -405,7 +405,7 @@ describe("devin session reader", () => {
       return bytes(doc("sess-1", []));
     };
     const controller = new AbortController();
-    await createDevinSessionReader({ transcriptsDir: DIR, readFile })("sess-1", undefined, controller.signal);
+    await createDevinSessionReader({ transcriptsDir: DIR, readFile, sessionsDb: false })("sess-1", undefined, controller.signal);
     expect(seen).toEqual([controller.signal]);
   });
 
@@ -414,7 +414,7 @@ describe("devin session reader", () => {
     dirs.push(dir);
     const document = doc("sess-1", [step({ source: "system", message: "prompt" }), toolStep("read", { file_path: "/repo/x" }, "contents")]);
     await writeFile(join(dir, "sess-1.json"), bytes(document));
-    const window = await createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir }) }).read(identity(), undefined, signal());
+    const window = await createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir, sessionsDb: false }) }).read(identity(), undefined, signal());
     expect(window.typedFailure).toBeUndefined();
     expect(window.events.map((event) => event.kind)).toEqual(["system", "agent"]);
   });
@@ -426,7 +426,7 @@ describe("devin session reader", () => {
     const target = join(dir, "devin", "cli", "transcripts");
     await mkdir(target, { recursive: true });
     await writeFile(join(target, "sess-9.json"), bytes(doc("sess-9", [step({ source: "user", message: "hi" })])));
-    const window = await createTraceSource({ devinSession: createDevinSessionReader() }).read(identity("sess-9"), undefined, signal());
+    const window = await createTraceSource({ devinSession: createDevinSessionReader({ sessionsDb: false }) }).read(identity("sess-9"), undefined, signal());
     expect(window.typedFailure).toBeUndefined();
     expect(window.events).toHaveLength(1);
   });
@@ -435,7 +435,7 @@ describe("devin session reader", () => {
     "resolves the default record dir under ~/.local/share when XDG_DATA_HOME is %s",
     async (_name, value) => {
       vi.stubEnv("XDG_DATA_HOME", value);
-      const window = await createTraceSource({ devinSession: createDevinSessionReader() }).read(identity("zz-herdr-t2-nonexistent-9e7f"), undefined, signal());
+      const window = await createTraceSource({ devinSession: createDevinSessionReader({ sessionsDb: false }) }).read(identity("zz-herdr-t2-nonexistent-9e7f"), undefined, signal());
       expect(window.typedFailure).toMatchObject({ kind: "source_unreadable" });
     },
   );

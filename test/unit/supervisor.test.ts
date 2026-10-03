@@ -16,7 +16,9 @@ import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervis
 import { reviewLogPaths, ReviewLogError, type SupervisionLogEntry, type SupervisionLogRecord, type SupervisionReviewLogEntry } from "../../src/supervision/review-log.js";
 import { buildWorkspaceView, executionDigestHash, type EvidenceScanner, type WorkspaceCommandRunner, type WorkspaceView } from "../../src/supervision/evidence.js";
 import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
+import { createDevinSessionReader } from "../../src/supervision/devin-trace.js";
 import { createTraceSource, type DevinSessionReader, type TraceSource } from "../../src/supervision/trace-source.js";
+import { addNodes, addSession, assistantMessage, createFixtureDb, toolMessage, userMessage } from "./devin-sessions-db-fixture.js";
 import { claudeQuotaSignal } from "../../src/supervision/claude-quota.js";
 import type { SupervisionWorkspaceRoot } from "../../src/job-registry.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
@@ -3204,6 +3206,32 @@ describe("the ADR-036 evidence cadence", () => {
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
+  });
+
+  it("reviews a working devin lane from the live session store while its transcript file is still absent", async () => {
+    const devinSession = { source: "devin", agent: "devin", kind: "id", value: "sess-1" };
+    const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
+    const dir = await mkdtemp(join(tmpdir(), "herdr-supervisor-devindb-"));
+    const db = createFixtureDb(join(dir, "sessions.db"));
+    addSession(db, "sess-1", 3);
+    addNodes(db, "sess-1", [
+      { nodeId: 1, parent: null, message: userMessage("do the thing") },
+      { nodeId: 2, parent: 1, message: assistantMessage("listing", { messageId: "a1", calls: [{ id: "c1", name: "exec", arguments: { command: "ls" } }] }) },
+      { nodeId: 3, parent: 2, message: toolMessage("c1", "listed") },
+    ]);
+    // The transcript dir exists but is empty — before the live reader this
+    // lane's cadence produced only ENOENT and never reached the reviewer.
+    const h = harness({
+      child: { agentName: "worker", agentKind: "devin", operatingPointId: "worker-devin" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
+      devinSession: createDevinSessionReader({ transcriptsDir: dir, sessionsDb: { dbPath: join(dir, "sessions.db") } }),
+    });
+    await h.supervisor.bind({ identity: devinIdentity, operatingPointId: "worker-devin" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
+    expect(h.reviewRequests[0]!.evidence!.trace.actions.map((action) => action.tool)).toEqual(["exec"]);
+    db.close();
   });
 
   it("keeps a typed trace failure silent as reviewer_unavailable and retries next cadence", async () => {

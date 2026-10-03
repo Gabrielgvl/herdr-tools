@@ -709,7 +709,7 @@ describe("through the real readers", () => {
       ],
     };
     await writeFile(join(dir, "sess-1.json"), JSON.stringify(document));
-    const source = createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir }) });
+    const source = createTraceSource({ devinSession: createDevinSessionReader({ transcriptsDir: dir, sessionsDb: false }) });
     const window = await source.read(
       { paneId: "w:p1", agentKind: "devin", agentSession: { source: "devin", agent: "devin", kind: "id", value: "sess-1" } },
       undefined,

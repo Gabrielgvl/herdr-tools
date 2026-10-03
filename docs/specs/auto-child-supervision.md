@@ -352,8 +352,13 @@ supervisor job settles immediately after the wake.
   `progress` (`SUPERVISION_PROGRESS_THRESHOLD` 0.60), falling through to `unknown` when no
   signal crosses. Temporal state is in-memory only.
 - Evidence: one bounded V2.1 state assembled in fixed order from the Task digest, structured
-  trace, Git workspace state, supplemental terminal lines, and version identity. Pi and Devin
-  use their structured trace readers. Other runners use a labelled `tmux-fallback` trace.
+  trace, Git workspace state, supplemental terminal lines, and version identity. Pi reads its
+  session JSONL directly. Devin's structured reader reads the committed main chain of the live
+  `sessions.db` store — read-only, version-gated, one short transaction per cadence, cursored
+  by `node_id` plus a rolling content anchor — so a working lane emits review evidence mid-turn;
+  a fresh read falls back to the turn-end transcript file when the store is absent, unopenable,
+  gated out, or missing the session, while an already-minted store cursor stays on the store.
+  Other runners use a labelled `tmux-fallback` trace.
   The production carrier builds the internal `supervisionDigest` from the Task's
   `objective`, `doneWhen`, and `constraints` — `scope` is not part of the digest — and
   the strict public schema has no `progressMarkers`, so reviewer evidence carries an

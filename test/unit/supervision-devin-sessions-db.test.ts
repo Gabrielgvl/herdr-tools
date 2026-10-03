@@ -518,13 +518,29 @@ describe("devin sessions.db reader", () => {
     expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 3 } });
   });
 
+  it.each([
+    ['{"role":"tool",', 3],
+    ['{"role":"user",', 4],
+    ['{"content":"' + "x".repeat(4096), 3],
+    ['{"content":"fake \\"role\\":\\"user\\"', 3],
+  ])("classifies an oversized invalid body from its bounded prefix: %s", async (prefix, step) => {
+    const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
+    addNodes(db, "sess-1", [
+      { nodeId: 6, parent: 4, message: assistantMessage("working", { messageId: "a1", calls: [{ id: "c1", name: "exec", arguments: {} }] }) },
+      { nodeId: 7, parent: 6, message: prefix + "x".repeat(5000) },
+    ]);
+    setHead(db, "sess-1", 7);
+    const window = await source(router({}, { dbPath, stepRawMaxBytes: 1024 })).read(identity(), undefined, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step } });
+  });
+
   it("fails source_exceeds_budget on an oversized node whose body is not even valid JSON", async () => {
     const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
     const trace = source(router({}, { dbPath, stepRawMaxBytes: 1024 }));
     addNode(db, "sess-1", { nodeId: 6, parent: 4, message: `{${"x".repeat(2_000)}` });
     setHead(db, "sess-1", 6);
     const window = await trace.read(identity(), undefined, signal());
-    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 3 } });
+    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 2 } });
   });
 
   it("fails source_malformed on an oversized orphan tool node", async () => {

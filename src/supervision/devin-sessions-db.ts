@@ -511,18 +511,21 @@ function loadMessage(db: DevinSessionsDbHandle, sessionId: string, node: number)
 
 /**
  * Role probe for a single selected node whose length alone exceeds the
- * per-step raw cap: the body is never loaded, but the step grammar still
+ * per-step raw cap: only a bounded prefix is loaded, but the step grammar still
  * needs the role — a tool node would fold into the open step, anything else
  * starts a new one.
  */
 function roleOf(db: DevinSessionsDbHandle, sessionId: string, node: number): string | null {
   const row = prepareGet(
     db,
-    `SELECT CASE WHEN json_valid(chat_message) THEN json_extract(chat_message, '$.role') ELSE NULL END AS role
+    `SELECT substr(chat_message, 1, 4096) AS prefix
      FROM message_nodes WHERE session_id = ? AND node_id = ? LIMIT 1`,
     [sessionId, node],
   );
-  return typeof row?.role === "string" ? row.role : null;
+  // Devin writes message_id before role. Match only these leading top-level
+  // members, never a role-like string inside content; other layouts fail closed.
+  if (typeof row?.prefix !== "string") return null;
+  return /^\s*\{\s*(?:"message_id"\s*:\s*"(?:[^"\\]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"\s*,\s*)?"role"\s*:\s*"(system|user|assistant|tool)"\s*[,}]/.exec(row.prefix)?.[1] ?? null;
 }
 
 /** The row-level shape checks run only on consumed nodes — a deferred tail is never judged. */
@@ -653,8 +656,10 @@ function readCommittedChain(
       // whatever its role is. Only the role decides whether the failing step
       // is the open one or the next, so probe it without loading the body.
       const role = roleOf(db, sessionId, skel.node);
-      if (role === "tool") {
-        if (open.length === 0 || open[0]!.role !== "assistant") throw malformedNode(skel.node, "orphan_tool_node");
+      if (role === "tool" || role === null) {
+        // An unknown role might belong to the open step. Do not flush it or
+        // advance its cursor: retrying is safer than dropping a tool result.
+        if (role === "tool" && (open.length === 0 || open[0]!.role !== "assistant")) throw malformedNode(skel.node, "orphan_tool_node");
         throw new DevinSourceError("source_exceeds_budget", { reason: "step_raw", step: priorSteps + consumed + 1, bytesAtLeast: openRaw + skel.len, budget: caps.stepRaw });
       }
       if (flush(false) !== "emitted") break;

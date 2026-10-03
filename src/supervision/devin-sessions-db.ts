@@ -13,17 +13,21 @@
  * - A version gate pins the exact observed schema — `app_state`
  *   `schema_compat_version` `"0"`, the seventeen `refinery_schema_history`
  *   migrations verbatim, the `sessions`/`message_nodes` columns the reader
- *   consumes, and the unique `(session_id, node_id)` index. The verdict is
- *   cached on the `schema_version` cookie so the column checks run only when
- *   the schema changes. A closed gate is permanent for the read: an undefined
- *   position falls back to the transcript reader, a store cursor throws
- *   `DEVIN_DB_SCHEMA` → `source_unreadable`.
+ *   consumes, and the unique `(session_id, node_id)` index. Compat and the
+ *   migration allow-list are re-checked on every read — they are data, not
+ *   DDL, so the `schema_version` cookie cannot see them change; the column
+ *   and index checks stay cached on the cookie. A closed gate is permanent
+ *   for the read: an undefined position falls back to the transcript reader,
+ *   a store cursor throws `DEVIN_DB_SCHEMA` → `source_unreadable`.
  *
  * - The cursor's stable position is `node_id` plus a rolling content anchor
  *   over the consumed main chain — never `row_id` or `created_at`, which the
- *   turn-end `INSERT OR REPLACE` batch re-mints. The `(count, max(row_id))`
- *   watermark over the consumed prefix detects that batch: a match is the fast
- *   path, a mismatch re-walks the consumed chain and re-verifies the anchor.
+ *   turn-end `INSERT OR REPLACE` batch re-mints. Every continuation read
+ *   re-walks the consumed chain's ancestry skeleton and re-rolls the anchor
+ *   over the consumed bodies (bounded by the re-verify byte ceiling): the
+ *   only check that also sees an in-place UPDATE, which moves neither the
+ *   prefix's count nor its max(row_id). The watermark minted into the cursor
+ *   is a diagnostic, not a detector.
  *
  * - Reads are one short transaction each: open `readOnly` with a ~250 ms busy
  *   timeout, `PRAGMA query_only = 1`, `BEGIN` … `COMMIT`, close. In WAL a
@@ -169,14 +173,12 @@ interface SkelRow {
   node?: unknown;
   parent?: unknown;
   len?: unknown;
-  role?: unknown;
 }
 
 interface Skel {
   node: number;
   parent: number | null;
   len: number;
-  role: string | null;
 }
 
 interface ParsedNode {
@@ -276,8 +278,11 @@ function gateOpen(db: DevinSessionsDbHandle, cache: GateCache): boolean {
     const compatRow = prepareGet(db, "SELECT value AS v FROM app_state WHERE key = 'schema_compat_version' LIMIT 1", []);
     const compat = typeof compatRow?.v === "string" ? compatRow.v : undefined;
     if (compat !== EXPECTED_COMPAT_VERSION) return false;
+    // The migration allow-list is data, not DDL: a new migration row does not
+    // move the schema cookie, so it is re-checked on every read.
+    if (!migrationsMatch(db)) return false;
     if (cache.cookie === cookie && cache.compat === compat) return true;
-    if (!migrationsMatch(db) || !columnsMatch(db) || !chainIndexMatch(db)) return false;
+    if (!columnsMatch(db) || !chainIndexMatch(db)) return false;
     cache.cookie = cookie;
     cache.compat = compat;
     return true;
@@ -381,37 +386,77 @@ function recomputeAnchor(node: number, rows: Array<{ node?: unknown; parent?: un
 }
 
 /**
- * The slow path after the prefix watermark changed — the turn-end batch
- * re-mints every `row_id`, so a mismatch is expected about once per turn. The
- * consumed chain's byte ceiling is checked before its bodies are loaded, then
- * the anchor is re-verified verbatim.
+ * Re-walk the consumed chain's ancestry skeleton — ids, parents and body
+ * lengths only — then re-roll the anchor over just those bodies. Continuation
+ * reads always take this path: an in-place UPDATE of a consumed row moves
+ * neither the prefix's count nor its max(row_id), so no watermark can see
+ * it. Only the consumed ancestry counts against the re-verify ceiling and
+ * gets its body loaded — abandoned roots, side branches and drafts below the
+ * cursor are neither hashed nor budgeted. A chain that can no longer be
+ * reproduced — a vanished node, a dangling or looping parent — is a rewrite.
  */
 function verifyPrefix(db: DevinSessionsDbHandle, sessionId: string, prior: DbCursor, reverifyMax: number): void {
-  const sum = prepareGet(db, "SELECT coalesce(sum(octet_length(chat_message)), 0) AS total FROM message_nodes WHERE session_id = ? AND node_id <= ?", [sessionId, prior.node]);
-  const total = intOf(sum?.total) ?? 0;
-  if (total > reverifyMax) {
-    throw new DevinSourceError("source_exceeds_budget", { reason: "reverify", bytesAtLeast: total, budget: reverifyMax });
+  if (prior.node === -1) {
+    // A steps-0 cursor consumed nothing; only the empty anchor can verify.
+    if (prior.anchor !== EMPTY_ANCHOR) throw new DevinSourceError("source_rewritten", { reason: "anchor_mismatch" });
+    return;
   }
   const rows = db
-    .prepare("SELECT node_id AS node, parent_node_id AS parent, chat_message AS msg FROM message_nodes WHERE session_id = ? AND node_id <= ? ORDER BY node_id LIMIT ?")
-    .all(sessionId, prior.node, prior.node + 2) as Array<{ node?: unknown; parent?: unknown; msg?: unknown }>;
-  if (recomputeAnchor(prior.node, rows) !== prior.anchor) {
+    .prepare(
+      `SELECT node_id AS node, parent_node_id AS parent, octet_length(chat_message) AS len
+       FROM message_nodes WHERE session_id = ? AND node_id <= ? ORDER BY node_id LIMIT ?`,
+    )
+    .all(sessionId, prior.node, prior.node + 2) as SkelRow[];
+  const byId = new Map<number, { parent: number | null; len: number }>();
+  for (const row of rows) {
+    const node = intOf(row.node);
+    const parent = row.parent === null ? null : intOf(row.parent);
+    const len = intOf(row.len);
+    // A corrupt row anywhere in the consumed prefix fails closed as a
+    // rewrite, matching the anchor's whole-prefix judgement.
+    if (node === undefined || parent === undefined || len === undefined) {
+      throw new DevinSourceError("source_rewritten", { reason: "anchor_mismatch" });
+    }
+    byId.set(node, { parent, len });
+  }
+  const ancestry: Array<{ node: number; parent: number | null }> = [];
+  const seen = new Set<number>();
+  let bytes = 0;
+  let current: number | null = prior.node;
+  while (current !== null) {
+    if (seen.has(current)) throw new DevinSourceError("source_rewritten", { reason: "anchor_mismatch" });
+    seen.add(current);
+    const row = byId.get(current);
+    if (row === undefined) throw new DevinSourceError("source_rewritten", { reason: "anchor_mismatch" });
+    bytes += row.len;
+    if (bytes > reverifyMax) {
+      throw new DevinSourceError("source_exceeds_budget", { reason: "reverify", bytesAtLeast: bytes, budget: reverifyMax });
+    }
+    ancestry.push({ node: current, parent: row.parent });
+    current = row.parent;
+  }
+  const consumed = ancestry.map(({ node, parent }) => ({
+    node,
+    parent,
+    msg: prepareGet(db, "SELECT chat_message AS msg FROM message_nodes WHERE session_id = ? AND node_id = ? LIMIT 1", [sessionId, node])?.msg,
+  }));
+  if (recomputeAnchor(prior.node, consumed) !== prior.anchor) {
     throw new DevinSourceError("source_rewritten", { reason: "anchor_mismatch" });
   }
 }
 
 /**
- * The new main-chain segment: every `node_id` above the cursor is classified
- * (ints and roles only — bodies load only for consumed steps), then the chain
- * is walked from the committed head down to the cursor. Passing below the
- * cursor or hitting a root first means the chain was re-rooted; a parent that
- * dangles inside the snapshot is malformed.
+ * The new main-chain segment: the skeleton above the cursor — ids, parents
+ * and body lengths only, so bodies of abandoned roots, side branches, draft
+ * tails and subagent chains are never parsed here — is walked from the
+ * committed head down to the cursor. A head rewound below the cursor, a
+ * walk that passes below it, or a root reached first means the chain was
+ * re-rooted; a parent that dangles inside the snapshot is malformed.
  */
 function chainSegment(db: DevinSessionsDbHandle, sessionId: string, priorNode: number, head: number | null, newNodesMax: number): Skel[] {
   const rows = db
     .prepare(
-      `SELECT node_id AS node, parent_node_id AS parent, octet_length(chat_message) AS len,
-              CASE WHEN json_valid(chat_message) THEN json_extract(chat_message, '$.role') ELSE NULL END AS role
+      `SELECT node_id AS node, parent_node_id AS parent, octet_length(chat_message) AS len
        FROM message_nodes WHERE session_id = ? AND node_id > ? ORDER BY node_id LIMIT ?`,
     )
     .all(sessionId, priorNode, newNodesMax + 1) as SkelRow[];
@@ -426,7 +471,7 @@ function chainSegment(db: DevinSessionsDbHandle, sessionId: string, priorNode: n
     if (node === undefined || len === undefined || parent === undefined) {
       throw new DevinSourceError("source_malformed", { reason: "row_invalid" });
     }
-    byId.set(node, { node, parent, len, role: typeof row.role === "string" ? row.role : null });
+    byId.set(node, { node, parent, len });
   }
   if (head === null) {
     // A committed head that vanished under a live cursor is a rewritten source.
@@ -438,10 +483,12 @@ function chainSegment(db: DevinSessionsDbHandle, sessionId: string, priorNode: n
   let current = head;
   for (;;) {
     if (current === priorNode) break;
+    // A head rewound below a live cursor is a revert: the consumed cursor is
+    // no longer an ancestor — rewritten, never corruption.
+    if (priorNode !== -1 && current < priorNode) throw new DevinSourceError("source_rewritten", { reason: "not_ancestor" });
     const row = byId.get(current);
-    // The walk only ever sits above the cursor: `=== priorNode` breaks and a
-    // parent below it throws on the previous iteration, so a missing row is
-    // always a dangling parent inside the snapshot.
+    // Every node above the cursor sits in the `node_id > priorNode` snapshot,
+    // so a miss here is always a dangling parent — malformed.
     if (row === undefined) throw new DevinSourceError("source_malformed", { reason: "chain_incomplete" });
     if (seen.has(current)) throw new DevinSourceError("source_malformed", { reason: "chain_cycle" });
     seen.add(current);
@@ -460,6 +507,22 @@ function loadMessage(db: DevinSessionsDbHandle, sessionId: string, node: number)
   const row = prepareGet(db, "SELECT chat_message AS msg FROM message_nodes WHERE session_id = ? AND node_id = ? LIMIT 1", [sessionId, node]);
   if (typeof row?.msg !== "string") throw malformedNode(node, "chain_incomplete");
   return row.msg;
+}
+
+/**
+ * Role probe for a single selected node whose length alone exceeds the
+ * per-step raw cap: the body is never loaded, but the step grammar still
+ * needs the role — a tool node would fold into the open step, anything else
+ * starts a new one.
+ */
+function roleOf(db: DevinSessionsDbHandle, sessionId: string, node: number): string | null {
+  const row = prepareGet(
+    db,
+    `SELECT CASE WHEN json_valid(chat_message) THEN json_extract(chat_message, '$.role') ELSE NULL END AS role
+     FROM message_nodes WHERE session_id = ? AND node_id = ? LIMIT 1`,
+    [sessionId, node],
+  );
+  return typeof row?.role === "string" ? row.role : null;
 }
 
 /** The row-level shape checks run only on consumed nodes — a deferred tail is never judged. */
@@ -529,75 +592,99 @@ function readCommittedChain(
   }
   const priorNode = prior?.node ?? -1;
   const priorSteps = prior?.steps ?? 0;
-  if (prior !== undefined) {
-    const mark = prefixWatermark(db, sessionId, prior.node);
-    if (mark.rows !== prior.rows || mark.maxRow !== prior.maxRow) verifyPrefix(db, sessionId, prior, caps.reverify);
-  }
+  if (prior !== undefined) verifyPrefix(db, sessionId, prior, caps.reverify);
   const segment = chainSegment(db, sessionId, priorNode, head, caps.newNodes);
 
-  // Group the segment into steps: non-tool nodes open one, tool nodes fold
-  // into the open agent step — the main chain's own grammar, mirrored from the
-  // transcript projection.
-  const groups: Skel[][] = [];
-  for (const row of segment) {
-    if (row.role === "tool") {
-      const open = groups[groups.length - 1];
-      if (open === undefined || open[0]!.role !== "assistant") throw malformedNode(row.node, "orphan_tool_node");
-      open.push(row);
-    } else {
-      groups.push([row]);
-    }
-  }
-
+  // The segment folds into steps in chain order — a non-tool node closes the
+  // open step and starts one, a tool node joins the open agent step — the
+  // main chain's own grammar, mirrored from the transcript projection. Bodies
+  // load only here, one selected node at a time under the per-step raw cap.
   const events: TraceEvent[] = [];
   let byteCount = 0;
   let consumed = 0;
   let consumedEnd = priorNode;
   let anchor = prior?.anchor ?? EMPTY_ANCHOR;
-  for (let index = 0; index < groups.length; index += 1) {
-    const nodes = groups[index]!;
+  let open: ParsedNode[] = [];
+  let openRaw = 0;
+  let result: DevinSessionRead | undefined;
+
+  const flush = (last: boolean): "emitted" | "full" | "deferred" | "skipped" => {
+    const nodes = open;
+    if (nodes.length === 0) return "emitted";
+    open = [];
+    openRaw = 0;
     const stepNumber = priorSteps + consumed + 1;
-    const raw = nodes.reduce((total, node) => total + node.len, 0);
-    if (raw > caps.stepRaw) {
-      throw new DevinSourceError("source_exceeds_budget", { reason: "step_raw", step: stepNumber, bytesAtLeast: raw, budget: caps.stepRaw });
-    }
-    const parsed = nodes.map((node) => parseNode(node.node, loadMessage(db, sessionId, node.node)));
-    if (index === groups.length - 1 && parsed[0]!.role === "assistant") {
+    if (last && nodes[0]!.role === "assistant") {
       // The last step is consumed only when every call has its tool node —
       // an in-flight call resolves on the next cadence, mirroring the Pi
       // adapter's unterminated-tail rule.
-      const resolved = new Set(parsed.slice(1).map((tool) => tool.toolCallId));
-      if (parsed[0]!.toolCalls?.some((call) => !resolved.has(call.id)) === true) break;
+      const resolved = new Set(nodes.slice(1).map((tool) => tool.toolCallId));
+      if (nodes[0]!.toolCalls?.some((call) => !resolved.has(call.id)) === true) return "deferred";
     }
-    const record = checkStep(projectStep(stepNumber, parsed), priorSteps + consumed);
+    const record = checkStep(projectStep(stepNumber, nodes), priorSteps + consumed);
     const bytes = Buffer.byteLength(JSON.stringify(record), "utf8");
     if (byteCount + bytes > caps.window) {
       if (events.length === 0) {
         // A first step that can never fit is reported once and consumed, so
         // the next window resumes after it instead of refusing it forever.
-        for (const node of parsed) anchor = rollAnchor(anchor, node.node, node.text);
-        consumedEnd = parsed[parsed.length - 1]!.node;
+        for (const node of nodes) anchor = rollAnchor(anchor, node.node, node.text);
+        consumedEnd = nodes[nodes.length - 1]!.node;
         const mark = prefixWatermark(db, sessionId, consumedEnd);
-        return {
+        result = {
           position: { session: sessionId, steps: stepNumber, anchor, db: { v: 1, node: consumedEnd, rows: mark.rows, maxRow: mark.maxRow } },
           events,
           skipped: { step: stepNumber, bytes },
         };
+        return "skipped";
       }
-      break;
+      return "full";
     }
     events.push({ kind: record.source as string, offset: stepNumber, bytes, record });
     byteCount += bytes;
-    for (const node of parsed) anchor = rollAnchor(anchor, node.node, node.text);
-    consumedEnd = parsed[parsed.length - 1]!.node;
+    for (const node of nodes) anchor = rollAnchor(anchor, node.node, node.text);
+    consumedEnd = nodes[nodes.length - 1]!.node;
     consumed += 1;
-  }
-
-  const mark = prefixWatermark(db, sessionId, consumedEnd);
-  return {
-    position: { session: sessionId, steps: priorSteps + consumed, anchor, db: { v: 1, node: consumedEnd, rows: mark.rows, maxRow: mark.maxRow } },
-    events,
+    return "emitted";
   };
+
+  for (const skel of segment) {
+    if (skel.len > caps.stepRaw) {
+      // The node can never be consumed — its step exceeds the raw cap
+      // whatever its role is. Only the role decides whether the failing step
+      // is the open one or the next, so probe it without loading the body.
+      const role = roleOf(db, sessionId, skel.node);
+      if (role === "tool") {
+        if (open.length === 0 || open[0]!.role !== "assistant") throw malformedNode(skel.node, "orphan_tool_node");
+        throw new DevinSourceError("source_exceeds_budget", { reason: "step_raw", step: priorSteps + consumed + 1, bytesAtLeast: openRaw + skel.len, budget: caps.stepRaw });
+      }
+      if (flush(false) !== "emitted") break;
+      throw new DevinSourceError("source_exceeds_budget", { reason: "step_raw", step: priorSteps + consumed + 1, bytesAtLeast: skel.len, budget: caps.stepRaw });
+    }
+    const parsed = parseNode(skel.node, loadMessage(db, sessionId, skel.node));
+    if (parsed.role === "tool") {
+      if (open.length === 0 || open[0]!.role !== "assistant") throw malformedNode(skel.node, "orphan_tool_node");
+      openRaw += skel.len;
+      if (openRaw > caps.stepRaw) {
+        throw new DevinSourceError("source_exceeds_budget", { reason: "step_raw", step: priorSteps + consumed + 1, bytesAtLeast: openRaw, budget: caps.stepRaw });
+      }
+      open.push(parsed);
+    } else {
+      if (flush(false) !== "emitted") break;
+      open = [parsed];
+      openRaw = skel.len;
+    }
+  }
+  if (result === undefined) {
+    flush(true);
+  }
+  if (result === undefined) {
+    const mark = prefixWatermark(db, sessionId, consumedEnd);
+    result = {
+      position: { session: sessionId, steps: priorSteps + consumed, anchor, db: { v: 1, node: consumedEnd, rows: mark.rows, maxRow: mark.maxRow } },
+      events,
+    };
+  }
+  return result;
 }
 
 /**

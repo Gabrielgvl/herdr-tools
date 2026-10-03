@@ -462,45 +462,54 @@ describe("the supervision registry", () => {
   });
 
   it("marks every reserved supervisor daemon-hosted, so a rootless reservation's appends fail closed — nothing lands under the process cwd", async () => {
-    const jobs = new JobRegistry();
-    const wakes: SupervisionWake[] = [];
-    let cadence: (() => void) | undefined;
-    // A claude child takes the tmux-fallback trace, so the registry's
-    // readTranscript stub supplies the window and the review completes into
-    // the real append seam.
-    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
-    const claudePane = { ...pane, agent: "claude", agent_session: claudeSession };
-    const server = scriptedServer({ snapshots: [snapshotResult([claudePane], [{ pane_id: "p1", name: "worker", agent: "claude", agent_session: claudeSession }])] });
-    const supervision = new SupervisionRegistry({
-      jobs,
-      settingsLoader: async () => settings,
-      readTranscript: async () => ["line"],
-      notifier: { wake: (wake) => { wakes.push(wake); } },
-      monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
-      typesafeCredentials: { read: async () => undefined },
-      reviewerFactory: () => ({ review: async () => ({ classification: "progress", summary: "moving" }) }),
-      scheduler: { setTimer: (callback) => { cadence = callback; return "timer"; }, clearTimer: () => { cadence = undefined; } },
-      daemonHosted: true,
-    });
-    const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" } });
-    await reservation.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
-    expect(typeof cadence).toBe("function");
-    // Each cadence's refused append degrades the view immediately; the damped
-    // policy announces reviewer_degraded only on the third consecutive refusal.
-    // Waiting on the review count outlives the whole cadence — degraded was
-    // already true from the first refusal, so it cannot mark a tick's end.
-    for (let tick = 1; tick <= 3; tick += 1) {
-      cadence!();
-      await vi.waitFor(() => expect(jobs.get(reservation.jobId)?.supervision?.reviewer.reviews).toHaveLength(tick));
-      expect(jobs.get(reservation.jobId)?.supervision?.reviewer.degraded).toBe(true);
-      expect(wakes.map((wake) => wake.event.type)).toEqual(tick < 3 ? [] : ["reviewer_degraded"]);
+    // A disposable ambient cwd: the no-write assertions must hold regardless
+    // of what .herdr state the real checkout happens to carry.
+    const cwd = await mkdtemp(join(tmpdir(), "herdr-registry-cwd-"));
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      const jobs = new JobRegistry();
+      const wakes: SupervisionWake[] = [];
+      let cadence: (() => void) | undefined;
+      // A claude child takes the tmux-fallback trace, so the registry's
+      // readTranscript stub supplies the window and the review completes into
+      // the real append seam.
+      const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+      const claudePane = { ...pane, agent: "claude", agent_session: claudeSession };
+      const server = scriptedServer({ snapshots: [snapshotResult([claudePane], [{ pane_id: "p1", name: "worker", agent: "claude", agent_session: claudeSession }])] });
+      const supervision = new SupervisionRegistry({
+        jobs,
+        settingsLoader: async () => settings,
+        readTranscript: async () => ["line"],
+        notifier: { wake: (wake) => { wakes.push(wake); } },
+        monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+        typesafeCredentials: { read: async () => undefined },
+        reviewerFactory: () => ({ review: async () => ({ classification: "progress", summary: "moving" }) }),
+        scheduler: { setTimer: (callback) => { cadence = callback; return "timer"; }, clearTimer: () => { cadence = undefined; } },
+        daemonHosted: true,
+      });
+      const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" } });
+      await reservation.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
+      expect(typeof cadence).toBe("function");
+      // Each cadence's refused append degrades the view immediately; the damped
+      // policy announces reviewer_degraded only on the third consecutive refusal.
+      // Waiting on the review count outlives the whole cadence — degraded was
+      // already true from the first refusal, so it cannot mark a tick's end.
+      for (let tick = 1; tick <= 3; tick += 1) {
+        cadence!();
+        await vi.waitFor(() => expect(jobs.get(reservation.jobId)?.supervision?.reviewer.reviews).toHaveLength(tick));
+        expect(jobs.get(reservation.jobId)?.supervision?.reviewer.degraded).toBe(true);
+        expect(wakes.map((wake) => wake.event.type)).toEqual(tick < 3 ? [] : ["reviewer_degraded"]);
+      }
+      // Three reviews completed and every append was refused closed.
+      expect(wakes[0]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
+      const cwdPaths = reviewLogPaths(cwd);
+      expect(existsSync(cwdPaths.directory)).toBe(false);
+      expect(existsSync(cwdPaths.reviews)).toBe(false);
+      await supervision.shutdown();
+    } finally {
+      cwdSpy.mockRestore();
+      await rm(cwd, { recursive: true, force: true });
     }
-    // Three reviews completed and every append was refused closed.
-    expect(wakes[0]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
-    const cwdPaths = reviewLogPaths(process.cwd());
-    expect(existsSync(cwdPaths.directory)).toBe(false);
-    expect(existsSync(cwdPaths.reviews)).toBe(false);
-    await supervision.shutdown();
   });
 
   it("lets a daemon-hosted reservation with an explicit reviewLogRoot append under it", async () => {

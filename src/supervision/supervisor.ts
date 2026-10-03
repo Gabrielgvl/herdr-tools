@@ -241,12 +241,14 @@ export interface SupervisorDependencies {
    */
   reviewLog?: SupervisionReviewLog;
   /**
-   * The trusted project root the review log appends under; defaults to
-   * `HERDR_PROJECT_DIR` when set, else the host's own launch directory — the
-   * same anchoring rule `resolveStartup` applies. On a daemon-hosted
-   * supervisor (`daemonHosted`) that ambient anchor does not exist: the
-   * daemon's own cwd is never a project root, so a reservation that supplies
-   * no root fails every append closed instead of writing under it.
+   * The trusted project root the review log appends under; a rootless
+   * reservation on a non-daemon host falls back to the ambient anchor —
+   * `HERDR_PROJECT_DIR` when set, else the host's own launch directory.
+   * That fallback serves only the in-process harness host (`createRuntime`):
+   * the production MCP surface is daemon-backed, and on a daemon-hosted
+   * supervisor (`daemonHosted`) no ambient anchor exists — the daemon's own
+   * cwd is never a project root, so a reservation that supplies no root
+   * fails every append closed instead of writing under it.
    */
   reviewLogRoot?: string;
   /**

@@ -6,6 +6,8 @@ Accepted. Ratified 2026-09-24 against the shipped implementation at policy revis
 
 Amended 2026-09-27 (herdr-governor rewrite, Phase 0): replicas were removed — the `replicas` Task field, the isolated `.herdr/worktrees` replica worktrees, and the per-child `worktree` result field no longer exist; every launch is exactly one child and the router still records `count`, always `1`. The `### Replicas` section and the other replica and worktree mentions below are historical.
 
+Amended 2026-10-02 at policy revision `adr-037-p6`: a recovery whose prior run failed on a provider limit keeps the prior route tier instead of lifting one — a limited provider carries no task-difficulty signal (see Recovery).
+
 ## Date
 
 2026-09-21
@@ -275,7 +277,7 @@ Recovery rules are:
 - `replicas` must be one;
 - `cwd` is forbidden;
 - runtime resumes the prior managed workspace or fails closed;
-- the effective start is at least the tier after the prior route tier; this recovery minimum applies after the one-tier caller cap, so the cap never removes it, and the Jev request, decision record, and persisted Task keep the caller's own tier;
+- the effective start is at least the tier after the prior route tier; this recovery minimum applies after the one-tier caller cap, so the cap never removes it, and the Jev request, decision record, and persisted Task keep the caller's own tier. When the prior run's terminal failure was a provider limit — `failed` lifecycle with detail `provider_limit` or `provider_limit_zero_progress` — the failure says nothing about task difficulty, so the recovery minimum is the prior route tier itself; an absent or unrecognized cause keeps the lift;
 - at `max`, the next tier remains `max`;
 - every operating point on the failed provider is excluded (`recovery_excluded`), not only the failed point;
 - unresolved or non-terminal prior-run evidence fails closed (`RECOVERY_SOURCE_UNRESOLVABLE`) rather than guessing the workspace state.
@@ -323,7 +325,7 @@ The decision log records bounded, non-secret evidence for:
 - operating-point metadata and deterministic exclusions;
 - the generated chain and selected point;
 - availability and recovery evidence;
-- catalog and policy revisions (`adr-037-p5` on new records, distinguishing them from historical `adr-037-p2`, `adr-037-p3`, and `adr-037-p4` measurements).
+- catalog and policy revisions (`adr-037-p6` on new records, distinguishing them from historical `adr-037-p2` through `adr-037-p5` measurements).
 
 Caller text, resource bodies, credentials, raw provider responses, and exception messages remain excluded.
 

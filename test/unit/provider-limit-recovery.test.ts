@@ -344,6 +344,9 @@ describe("Devin provider limit", () => {
     });
     const recovered = await execute(toolFor({ catalog: devinCatalog(), cli: harness.cli, supervision, handoffs, availabilityFailureRecorder: recorder, devinQuotaReader: quota }), { ...TASK, recoveryOf: stalled.handoff!.allocation.runId });
     expect(recovered.details!.outcome).toBe("launched");
+    // A provider-limit failure carries no difficulty signal: the recovery
+    // stays at the prior route tier instead of lifting to strong.
+    expect(recovered.details).toMatchObject({ effectiveTier: "standard" });
     // The failed provider's points are excluded from the recovery route.
     expect(recovered.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "pi:a:low" });
     expect((await readHandoffProvenance(supervision.bound[1]!.handoff!.allocation)).task).toMatchObject({ recoveryOf: stalled.handoff!.allocation.runId });
@@ -403,6 +406,8 @@ describe("provider-limit auto-recovery", () => {
     expect(recovered.identity.agentKind).toBe("pi");
     expect(recovered.operatingPointId).toBe("pi:a:low");
     const recoveredState = await readHandoffState(recovered.handoff!.allocation);
+    // The zero-progress limit kept the recovery at the prior route tier.
+    expect(recoveredState.child.route?.tier).toBe("standard");
     expect(recoveredState.child.route?.operatingPointId).toBe("pi:a:low");
     const provenance = await readHandoffProvenance(recovered.handoff!.allocation);
     expect(provenance.task).toMatchObject({ objective: TASK.objective, retention: "keep", recoveryOf: dead.handoff!.allocation.runId });

@@ -6,7 +6,7 @@
  */
 
 /** Policy revision recorded in decision evidence. */
-export const POLICY_REVISION = "adr-037-p5";
+export const POLICY_REVISION = "adr-037-p6";
 
 /**
  * The caller's requested starting quality and compute posture, in ascending
@@ -180,7 +180,8 @@ export function resolveTierPolicy(profile: WorkloadProfile, requestedTier?: Qual
 /**
  * Recovery start tier: folded into the router's Task admission (the lifted
  * RoutingTask carries the prior route tier; `maxTier(effectiveStart,
- * nextTier(prior))` applies there).
+ * nextTier(prior))` applies there — a provider-limit failure carries no
+ * task-difficulty signal, so its recovery minimum is the prior tier itself).
  */
 
 export type RoutingPolicyErrorCode = "RECOVERY_SOURCE_UNRESOLVABLE";

@@ -303,15 +303,15 @@ tierChains:
     - agy:gemini-3.8-flash-low
   strong:
     - devin:swe-2-max
-    - claude:opus:xhigh
+    - claude:opus:high
     - pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high
     - pi:openai-codex/gpt-6.1-sol:xhigh
     - pi:zai/glm-5.3-flash:max
     - agy:gemini-3.8-flash-high
   frontier:
+    - claude:opus:xhigh
+    - pi:openai-codex/gpt-6-astra:xhigh
     - claude:fable:low
-    - pi:openai-codex/gpt-6-astra:high
-    - claude:opus:max
     - devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium
   max:
     - claude:fable:max

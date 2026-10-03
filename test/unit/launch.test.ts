@@ -920,6 +920,15 @@ describe("herdr_launch task cutover", () => {
       }
     });
 
+    it("still lifts one tier when a handed_off prior run carries a provider-limit detail", async () => {
+      // Only `failed` marks a provider-limit failure (adr-037-p6): a handoff
+      // accepted while the exiting cycle was limited keeps the lift.
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", lifecycleDetail: "provider_limit", routeTier: "standard" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "strong" });
+    });
+
     it("derives a partial workspace from an unresolved prior lifecycle and lifts the floor", async () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "recovery_pending", routeTier: "standard" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);

@@ -259,6 +259,34 @@ describe("devin sessions.db reader", () => {
     expect(window.cursorTo).toEqual(first.cursorTo);
   });
 
+  it("fails source_rewritten when a consumed node is UPDATEd in place, without a remint", async () => {
+    const { dbPath, db } = seededStore(8);
+    const trace = source(router({}, { dbPath }));
+    const first = await trace.read(identity(), undefined, signal());
+    // An in-place UPDATE moves neither count(*) nor max(row_id): the prefix
+    // watermark alone cannot see it, so the anchor must re-verify regardless.
+    db.prepare("UPDATE message_nodes SET chat_message = ? WHERE session_id = 'sess-1' AND node_id = 6").run(
+      JSON.stringify(assistantMessage("EDITED IN PLACE", { messageId: "a1" })),
+    );
+    const window = await trace.read(identity(), first.cursorTo, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_rewritten", detail: { reason: "anchor_mismatch" } });
+    expect(window.events).toEqual([]);
+    expect(window.cursorTo).toEqual(first.cursorTo);
+  });
+
+  it("fails source_rewritten when the committed head rewinds to an already-consumed node", async () => {
+    const { dbPath, db } = seededStore(8);
+    const trace = source(router({}, { dbPath }));
+    const first = await trace.read(identity(), undefined, signal());
+    // A revert: main_chain_id moves back to consumed node 4. The walk from the
+    // head can never reach the cursor at node 8 — a rewrite, not corruption.
+    setHead(db, "sess-1", 4);
+    const window = await trace.read(identity(), first.cursorTo, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_rewritten", detail: { reason: "not_ancestor" } });
+    expect(window.events).toEqual([]);
+    expect(window.cursorTo).toEqual(first.cursorTo);
+  });
+
   it("fails source_rewritten when the head re-roots to a branch without the cursor", async () => {
     const { dbPath, db } = seededStore(8);
     const trace = source(router({}, { dbPath }));
@@ -365,6 +393,24 @@ describe("devin sessions.db reader", () => {
     expect(window.events).toEqual([]);
   });
 
+  it("closes the gate when a migration row appears after a successful read", async () => {
+    const { dbPath, db } = seededStore(8);
+    const document = atifDoc("sess-1", [atifStep(1, { source: "user", message: "prompt" })]);
+    const trace = source(router({ [pathOf("sess-1")]: document }, { dbPath }));
+    const first = await trace.read(identity(), undefined, signal());
+    expect(first.typedFailure).toBeUndefined();
+    // Migration rows are data, not DDL: inserting one does not bump the
+    // schema cookie, so the allow-list is re-checked on every read.
+    db.prepare("INSERT INTO refinery_schema_history (version, name) VALUES (18, 'unknown_future')").run();
+    const window = await trace.read(identity(), first.cursorTo, signal());
+    expect(window.typedFailure).toEqual({ kind: "source_unreadable", detail: { code: "DEVIN_DB_SCHEMA" } });
+    expect(window.events).toEqual([]);
+    const fresh = await trace.read(identity(), undefined, signal());
+    expect(fresh.typedFailure).toBeUndefined();
+    expect(fresh.events.map((event) => event.kind)).toEqual(["user"]);
+    expect((fresh.events[0]!.record as Record<string, unknown>).timestamp).toBe("t1");
+  });
+
   it.each([5, 6, 10])("treats sqlite errcode %i as transient — never a transcript fallback", async (errcode) => {
     const openDatabase: DevinSessionsDbOpener = async () => {
       throw Object.assign(new Error("database is busy"), { errcode });
@@ -429,6 +475,90 @@ describe("devin sessions.db reader", () => {
     expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "new_nodes" } });
   });
 
+  it("reads the forest skeleton only — bodies off the main chain are never parsed or budgeted", async () => {
+    const { dbPath, db } = seededStore(8);
+    // A second abandoned branch past the head: a >8 MiB body that is not even
+    // valid JSON, plus its child. Neither can be a consumed chain node, so
+    // neither may be parsed — and the oversized one may not trip any byte cap.
+    addNodes(db, "sess-1", [
+      { nodeId: 10, parent: null, message: `{${"x".repeat(9 * 1024 * 1024)}` },
+      { nodeId: 11, parent: 10, message: userMessage("abandoned too", "r11") },
+    ]);
+    const prepared: string[] = [];
+    const openDatabase: DevinSessionsDbOpener = (path, timeout) => {
+      const inner = new DatabaseSync(path, { readOnly: true, timeout });
+      return {
+        prepare: (sql) => {
+          prepared.push(sql);
+          return inner.prepare(sql);
+        },
+        exec: (sql) => inner.exec(sql),
+        close: () => inner.close(),
+      };
+    };
+    const window = await source(router({}, { dbPath, openDatabase })).read(identity(), undefined, signal());
+    expect(window.typedFailure).toBeUndefined();
+    expect(window.events.map((event) => event.offset)).toEqual([1, 2, 3]);
+    // Skeleton queries select ids, parents and lengths only; roles and bodies
+    // are read per consumed node, never by parsing every forest row.
+    for (const sql of prepared) {
+      expect(sql).not.toMatch(/json_(valid|extract)/i);
+    }
+  });
+
+  it("fails source_exceeds_budget when a folded tool node alone crosses the raw cap", async () => {
+    const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
+    const trace = source(router({}, { dbPath, stepRawMaxBytes: 1024 }));
+    addNodes(db, "sess-1", [
+      { nodeId: 6, parent: 4, message: assistantMessage("working", { messageId: "a1", calls: [{ id: "c1", name: "exec", arguments: {} }] }) },
+      { nodeId: 7, parent: 6, message: toolMessage("c1", "x".repeat(2_000)) },
+    ]);
+    setHead(db, "sess-1", 7);
+    const window = await trace.read(identity(), undefined, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 3 } });
+  });
+
+  it("fails source_exceeds_budget on an oversized node whose body is not even valid JSON", async () => {
+    const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
+    const trace = source(router({}, { dbPath, stepRawMaxBytes: 1024 }));
+    addNode(db, "sess-1", { nodeId: 6, parent: 4, message: `{${"x".repeat(2_000)}` });
+    setHead(db, "sess-1", 6);
+    const window = await trace.read(identity(), undefined, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 3 } });
+  });
+
+  it("fails source_malformed on an oversized orphan tool node", async () => {
+    const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
+    const trace = source(router({}, { dbPath, stepRawMaxBytes: 1024 }));
+    addNode(db, "sess-1", { nodeId: 6, parent: 4, message: toolMessage("c1", "x".repeat(2_000)) });
+    setHead(db, "sess-1", 6);
+    const window = await trace.read(identity(), undefined, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_malformed", detail: { reason: "orphan_tool_node" } });
+  });
+
+  it("fails source_exceeds_budget when a step's combined node bytes cross the raw cap", async () => {
+    const { dbPath, db } = seededStore(4, midTurnChain().slice(0, 5));
+    const trace = source(router({}, { dbPath, stepRawMaxBytes: 1024 }));
+    addNodes(db, "sess-1", [
+      {
+        nodeId: 6,
+        parent: 4,
+        message: assistantMessage("working", {
+          messageId: "a1",
+          calls: [
+            { id: "c1", name: "exec", arguments: {} },
+            { id: "c2", name: "exec", arguments: {} },
+          ],
+        }),
+      },
+      { nodeId: 7, parent: 6, message: toolMessage("c1", "x".repeat(900)) },
+      { nodeId: 8, parent: 7, message: toolMessage("c2", "x".repeat(900)) },
+    ]);
+    setHead(db, "sess-1", 8);
+    const window = await trace.read(identity(), undefined, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "step_raw", step: 3 } });
+  });
+
   it("fails source_exceeds_budget when the turn-end re-verify exceeds its cap", async () => {
     const { dbPath, db } = seededStore(8);
     const trace = source(router({}, { dbPath, reverifyMaxBytes: 10 }));
@@ -436,6 +566,21 @@ describe("devin sessions.db reader", () => {
     remintNodes(db, "sess-1");
     const window = await trace.read(identity(), first.cursorTo, signal());
     expect(window.typedFailure).toMatchObject({ kind: "source_exceeds_budget", detail: { reason: "reverify" } });
+  });
+
+  it("measures the re-verify ceiling on the consumed chain only, ignoring abandoned-branch bytes", async () => {
+    const chain = midTurnChain();
+    chain[1] = { nodeId: 1, parent: 0, message: userMessage("x".repeat(4_000), "r1") };
+    const { dbPath, db } = seededStore(8, chain);
+    const trace = source(router({}, { dbPath, reverifyMaxBytes: 2_000 }));
+    const first = await trace.read(identity(), undefined, signal());
+    expect(first.typedFailure).toBeUndefined();
+    remintNodes(db, "sess-1");
+    // The prefix below the cursor holds ~4 KiB of abandoned-branch bodies the
+    // anchor never hashed; only the small consumed ancestry counts.
+    const window = await trace.read(identity(), first.cursorTo, signal());
+    expect(window.typedFailure).toBeUndefined();
+    expect(window.events).toEqual([]);
   });
 
   it.each([
@@ -585,6 +730,40 @@ describe("devin sessions.db reader", () => {
       source: "devin-session",
       position: { session: "sess-1", steps: 0, anchor: expect.stringMatching(/^[0-9a-f]{64}$/), db: { v: 1, node: -1, rows: 0, maxRow: 0 } },
     });
+  });
+
+  it("re-verifies a steps-0 store cursor while the session still has no head", async () => {
+    const { dbPath } = seededStore(null, []);
+    const trace = source(router({}, { dbPath }));
+    const first = await trace.read(identity(), undefined, signal());
+    const second = await trace.read(identity(), first.cursorTo, signal());
+    expect(second.typedFailure).toBeUndefined();
+    expect(second.events).toEqual([]);
+    expect(second.cursorTo).toEqual(first.cursorTo);
+  });
+
+  it("issues the prefix watermark query only once per read", async () => {
+    const { dbPath } = seededStore(8);
+    const trace = source(router({}, { dbPath }));
+    const first = await trace.read(identity(), undefined, signal());
+    const prepared: string[] = [];
+    const openDatabase: DevinSessionsDbOpener = (path, timeout) => {
+      const inner = new DatabaseSync(path, { readOnly: true, timeout });
+      return {
+        prepare: (sql) => {
+          prepared.push(sql);
+          return inner.prepare(sql);
+        },
+        exec: (sql) => inner.exec(sql),
+        close: () => inner.close(),
+      };
+    };
+    // An unchanged continuation mints exactly one watermark — the cursor's —
+    // instead of a second identical one in the same transaction.
+    const window = await source(router({}, { dbPath, openDatabase })).read(identity(), first.cursorTo, signal());
+    expect(window.typedFailure).toBeUndefined();
+    expect(window.cursorTo).toEqual(first.cursorTo);
+    expect(prepared.filter((sql) => sql.includes("count(*) AS rows"))).toHaveLength(1);
   });
 });
 
@@ -747,15 +926,26 @@ describe("devin sessions.db reader edge paths", () => {
     expect(window.cursorTo).toMatchObject({ position: { db: { node: 8, rows: 0, maxRow: 0 } } });
   });
 
-  it("re-verifies the consumed chain when the byte-sum aggregate is absent", async () => {
+  it("fails source_rewritten on a forged steps-0 store cursor", async () => {
+    const { dbPath } = seededStore(null, []);
+    // node -1 consumed nothing, so only the empty anchor can verify — a
+    // minted-looking cursor with any other anchor is a rewrite.
+    const prior: TraceCursor = {
+      source: "devin-session",
+      position: { session: "sess-1", steps: 0, anchor: "f".repeat(64), db: { v: 1, node: -1, rows: 0, maxRow: 0 } },
+    };
+    const window = await source(router({}, { dbPath })).read(identity(), prior, signal());
+    expect(window.typedFailure).toMatchObject({ kind: "source_rewritten", detail: { reason: "anchor_mismatch" } });
+  });
+
+  it("re-verifies the consumed chain when the ancestry skeleton returns nothing", async () => {
     const { dbPath, db } = seededStore(8);
     const trace = source(router({}, { dbPath }));
     const first = await trace.read(identity(), undefined, signal());
     remintNodes(db, "sess-1");
-    const openDatabase = spoofingOpener(dbPath, new Map([["coalesce(sum(octet_length(chat_message))", { get: () => undefined }]]));
+    const openDatabase = spoofingOpener(dbPath, new Map([["node_id <= ? ORDER BY node_id", {}]]));
     const window = await source(router({}, { dbPath, openDatabase })).read(identity(), first.cursorTo, signal());
-    expect(window.typedFailure).toBeUndefined();
-    expect(window.events).toEqual([]);
+    expect(window.typedFailure).toMatchObject({ kind: "source_rewritten", detail: { reason: "anchor_mismatch" } });
   });
 
   it("falls back to the transcript reader when the store's exec channel fails", async () => {

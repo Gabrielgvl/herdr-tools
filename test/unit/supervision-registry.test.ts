@@ -1,4 +1,5 @@
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,7 @@ import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
 import { ReviewerFailure } from "../../src/reviewer.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
+import { reviewLogPaths } from "../../src/supervision/review-log.js";
 import { scriptedServer } from "./supervision-peer.js";
 import { TypeSafeSupervisionReviewer, type SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import type { EvidenceState, WorkspaceCommandRunner } from "../../src/supervision/evidence.js";
@@ -457,6 +459,76 @@ describe("the supervision registry", () => {
     await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: { agentKind: "pi", status: "working", revision: 0 }, evidence: {} as EvidenceState }, new AbortController().signal))
       .rejects.toThrowError(ReviewerFailure);
     await f.supervision.shutdown();
+  });
+
+  it("marks every reserved supervisor daemon-hosted, so a rootless reservation's appends fail closed — nothing lands under the process cwd", async () => {
+    const jobs = new JobRegistry();
+    const wakes: SupervisionWake[] = [];
+    let cadence: (() => void) | undefined;
+    // A claude child takes the tmux-fallback trace, so the registry's
+    // readTranscript stub supplies the window and the review completes into
+    // the real append seam.
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudePane = { ...pane, agent: "claude", agent_session: claudeSession };
+    const server = scriptedServer({ snapshots: [snapshotResult([claudePane], [{ pane_id: "p1", name: "worker", agent: "claude", agent_session: claudeSession }])] });
+    const supervision = new SupervisionRegistry({
+      jobs,
+      settingsLoader: async () => settings,
+      readTranscript: async () => ["line"],
+      notifier: { wake: (wake) => { wakes.push(wake); } },
+      monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+      typesafeCredentials: { read: async () => undefined },
+      reviewerFactory: () => ({ review: async () => ({ classification: "progress", summary: "moving" }) }),
+      scheduler: { setTimer: (callback) => { cadence = callback; return "timer"; }, clearTimer: () => { cadence = undefined; } },
+      daemonHosted: true,
+    });
+    const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" } });
+    await reservation.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
+    expect(typeof cadence).toBe("function");
+    cadence!();
+    await vi.waitFor(() => expect(wakes.map((wake) => wake.event.type)).toEqual(["reviewer_degraded"]));
+    const cwdPaths = reviewLogPaths(process.cwd());
+    expect(existsSync(cwdPaths.directory)).toBe(false);
+    expect(existsSync(cwdPaths.reviews)).toBe(false);
+    await supervision.shutdown();
+  });
+
+  it("lets a daemon-hosted reservation with an explicit reviewLogRoot append under it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-registry-reviewlog-"));
+    const jobs = new JobRegistry();
+    const wakes: SupervisionWake[] = [];
+    let cadence: (() => void) | undefined;
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudePane = { ...pane, agent: "claude", agent_session: claudeSession };
+    const server = scriptedServer({ snapshots: [snapshotResult([claudePane], [{ pane_id: "p1", name: "worker", agent: "claude", agent_session: claudeSession }])] });
+    const supervision = new SupervisionRegistry({
+      jobs,
+      settingsLoader: async () => settings,
+      readTranscript: async () => ["line"],
+      notifier: { wake: (wake) => { wakes.push(wake); } },
+      monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+      typesafeCredentials: { read: async () => undefined },
+      reviewerFactory: () => ({ review: async () => ({ classification: "progress", summary: "moving" }) }),
+      scheduler: { setTimer: (callback) => { cadence = callback; return "timer"; }, clearTimer: () => { cadence = undefined; } },
+      daemonHosted: true,
+    });
+    try {
+      const reservation = await supervision.reserve({
+        child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
+        settings: { reviewLogRoot: root },
+      });
+      await reservation.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
+      cadence!();
+      await vi.waitFor(async () => {
+        const records = (await readFile(reviewLogPaths(root).reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({ type: "review", agentName: "worker", agentKind: "claude", classification: "progress", attention: false });
+      });
+      expect(wakes).toEqual([]);
+    } finally {
+      await supervision.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("refuses to reserve when the monitor cannot start", async () => {

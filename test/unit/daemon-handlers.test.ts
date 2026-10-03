@@ -500,6 +500,9 @@ describe("daemon launch handler — mailbox capacity admission (F2)", () => {
 describe("daemon launch handler — intent-gated execution", () => {
   it("launches end to end: runtime-minted launchId, ordered boundary writes, herdr-run marker, completed intent", async () => {
     const fx = await harness();
+    const requests: Array<Parameters<typeof fx.supervision.reserve>[0]> = [];
+    const baseReserve = fx.supervision.reserve.bind(fx.supervision);
+    fx.supervision.reserve = async (request) => { requests.push(request); return baseReserve(request); };
     const reply = await handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)) as DaemonLaunchReply & { result: LaunchResult };
     expect(reply.kind).toBe("launch");
     expect(reply.state).toBe("completed");
@@ -525,6 +528,10 @@ describe("daemon launch handler — intent-gated execution", () => {
     expect(positions).toEqual([0, 1, 2, 3, 4, fx.events.length - 1]);
     // The contract the child received carries the run's herdr-run marker.
     expect(fx.prompts[0]).toContain(`herdr-run:${intent.children[0]!.runId}`);
+    // The supervision reservation anchors the review log on the D2a-verified
+    // project root — never the daemon's own cwd.
+    expect(requests[0]?.settings?.reviewLogRoot).toBe(fx.projectRoot);
+    expect(requests[0]?.settings?.reviewLogRoot).not.toBe(process.cwd());
   });
 
   it("proves gate evidence is durable before the child supervision bind", async () => {

@@ -1,9 +1,11 @@
 /**
  * The ADR-035 D1 durable supervision review log: append-once JSONL records at
  * `<root>/.herdr/supervision/reviews.jsonl`, where `root` is the trusted
- * manager/session project directory — the anchor the hosts already use
- * (`HERDR_PROJECT_DIR` when set, else the host's own launch directory), never a
- * caller-controlled child `cwd`.
+ * manager/session project directory — the reservation's explicit root, else
+ * the anchor in-process hosts already use (`HERDR_PROJECT_DIR` when set,
+ * else the host's own launch directory), never a caller-controlled child
+ * `cwd` and never the daemon's own cwd (a daemon-hosted supervisor without
+ * an explicit root fails its appends closed).
  *
  * One `review` record persists per completed review: timestamp, job, child
  * name and kind, classification, every signal probability including the
@@ -318,10 +320,14 @@ export function reviewLogPaths(root: string): SupervisionReviewLogPaths {
 }
 
 /**
- * The trusted project root when no caller supplies one: the same anchor the
- * hosts use — `HERDR_PROJECT_DIR` when it is set, else the host's own launch
- * directory. An unusable value fails the append's absolute-root check rather
- * than silently re-anchoring.
+ * The ambient project-root anchor an in-process host may fall back to when
+ * no caller supplies one: `HERDR_PROJECT_DIR` when it is set, else the
+ * host's own launch directory — the same anchoring rule `resolveStartup`
+ * applies. Only in-process hosts may consult it: a daemon-hosted supervisor
+ * never reaches this fallback, since the daemon's own cwd is never a
+ * project root — a missing explicit root fails the append closed. An
+ * unusable value fails the append's absolute-root check rather than
+ * silently re-anchoring.
  */
 export function defaultReviewLogRoot(env: NodeJS.ProcessEnv = process.env): string {
   return env.HERDR_PROJECT_DIR ?? process.cwd();

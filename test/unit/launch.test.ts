@@ -602,6 +602,10 @@ describe("herdr_launch task cutover", () => {
     expect(settings).not.toHaveProperty("forbiddenTools");
     // The canonical launch cwd is the trusted workspace root.
     expect(settings.workspaceRoot).toEqual({ available: true, root: repoRoot });
+    // The review log anchors on the launch's trusted root — the same
+    // `deps.cwd ?? ctx.cwd` the router decision log uses — never the
+    // supervising process's own cwd.
+    expect(settings.reviewLogRoot).toBe(repoRoot);
   });
 
   it("canonicalizes the launch cwd and fails closed on unusable directories", async () => {
@@ -622,6 +626,8 @@ describe("herdr_launch task cutover", () => {
       expect(linked.details).toMatchObject({ outcome: "launched" });
       // The canonical realpath is the trusted root — not the caller's spelling.
       expect(requests[0]!.settings!.workspaceRoot).toEqual({ available: true, root: realpathSync(real) });
+      // The review log anchors on the project root, not the child cwd.
+      expect(requests[0]!.settings!.reviewLogRoot).toBe(repoRoot);
 
       const tool = toolFor({ catalog, cli: makeCli().cli, supervision });
       await expect(tool.execute("call", task({ cwd: "definitely/missing" }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });

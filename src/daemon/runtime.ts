@@ -85,6 +85,15 @@ export interface SharedRuntimeDeps {
    * never free-form wire content.
    */
   log?: (line: string) => void;
+  /**
+   * Marks this assembly daemon-hosted: the supervising process's own cwd and
+   * env were never verified as a project anchor, so reserved supervisors
+   * never fall back to `process.cwd()` for the review log — a reservation
+   * without an explicit `reviewLogRoot` fails its appends closed.
+   * `createDaemonRuntime` sets it; in-process hosts leave it unset and keep
+   * the `HERDR_PROJECT_DIR`/launch-directory anchor.
+   */
+  daemonHosted?: boolean;
 }
 
 export interface SharedRuntime {
@@ -127,6 +136,7 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
     ...(wiring.selfClose === undefined ? {} : { selfClose: wiring.selfClose }),
     ...(wiring.hints === undefined ? {} : { hints: wiring.hints }),
     ...(deps.log === undefined ? {} : { log: deps.log }),
+    ...(deps.daemonHosted === true ? { daemonHosted: true } : {}),
     handoffs,
     // The repair prompt rides the shared pane-write section so a lane-
     // retirement close holding the lease can never dispatch between its final
@@ -256,6 +266,10 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   let selfClose: SelfCloseTracker = createSelfCloseTracker();
   const shared = createSharedRuntime({
     ...deps,
+    // The daemon's own cwd is never a project root: daemon-hosted supervision
+    // requires an explicit reviewLogRoot on every reservation — launches pass
+    // the D2a-verified project root, reattach the recorded one.
+    daemonHosted: true,
     wire: (parts) => {
       const host = deps.wire?.(parts) ?? {};
       // §11: the qualified-kind set is empty unless the daemon start option

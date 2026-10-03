@@ -92,6 +92,7 @@ import {
   appendSupervisionReview,
   defaultReviewLogRoot,
   representationForTraceSource,
+  ReviewLogError,
   type SupervisionReviewLog,
   type SupervisionTier0Violation,
 } from "./review-log.js";
@@ -242,9 +243,21 @@ export interface SupervisorDependencies {
   /**
    * The trusted project root the review log appends under; defaults to
    * `HERDR_PROJECT_DIR` when set, else the host's own launch directory — the
-   * same anchoring rule `resolveStartup` applies.
+   * same anchoring rule `resolveStartup` applies. On a daemon-hosted
+   * supervisor (`daemonHosted`) that ambient anchor does not exist: the
+   * daemon's own cwd is never a project root, so a reservation that supplies
+   * no root fails every append closed instead of writing under it.
    */
   reviewLogRoot?: string;
+  /**
+   * Daemon-hosted supervision: the supervising process's cwd and env were
+   * never verified as a project anchor, so the ambient `defaultReviewLogRoot`
+   * fallback is disabled and `reviewLogRoot` is required for the durable
+   * review log. A missing root surfaces as `REVIEW_LOG_UNAVAILABLE` on each
+   * append — the same degraded telemetry path as any other sink failure,
+   * never a write under the daemon's own directory.
+   */
+  daemonHosted?: boolean;
   cadenceMs: number;
   clock: { now(): number };
   scheduler?: SupervisionScheduler;
@@ -2128,9 +2141,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       },
       ...(wake === undefined ? {} : { wake: { eventId: wake.eventId, eventType: wake.type, atMs: wake.atMs } }),
     }, {
-      root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
+      root: this.reviewLogRoot(),
       now: () => new Date(this.deps.clock.now()),
     });
+  }
+
+  /**
+   * The root the review log appends under: the reservation's explicit
+   * `reviewLogRoot`, else the ambient host anchor (`HERDR_PROJECT_DIR`, then
+   * the host's launch directory). A daemon-hosted supervisor has no ambient
+   * anchor — its own cwd is never a project root — so a rootless daemon
+   * reservation refuses here before any filesystem touch: the append rejects
+   * `REVIEW_LOG_UNAVAILABLE` and the cadence degrades like a reviewer
+   * failure, with nothing ever written.
+   */
+  private reviewLogRoot(): string {
+    const root = this.deps.reviewLogRoot ?? (this.deps.daemonHosted === true ? undefined : defaultReviewLogRoot());
+    if (root === undefined) throw new ReviewLogError("Supervision review log root is unavailable");
+    return root;
   }
 
   /**
@@ -2176,7 +2204,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         details: event.details,
       })),
     }, {
-      root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
+      root: this.reviewLogRoot(),
       now: () => new Date(this.deps.clock.now()),
     });
   }

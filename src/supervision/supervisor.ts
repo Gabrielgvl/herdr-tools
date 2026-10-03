@@ -361,6 +361,9 @@ const EVIDENCE_OVERFLOW_FAILURES: ReadonlySet<string> = new Set(["record_exceeds
  */
 const SUPERVISION_RECONCILIATION_DEGRADED_EVENT_THRESHOLD = 3;
 
+/** Review health uses the same sustained-outage policy; a transient failure stays view-only. */
+const SUPERVISION_REVIEWER_DEGRADED_EVENT_THRESHOLD = 3;
+
 /** One emitted Tier-0 wake paired with its closed violation kind, for the durable append that follows it. */
 interface Tier0ViolationReport {
   violation: SupervisionTier0Violation;
@@ -472,6 +475,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /** The currently-degraded episode crossed the announce threshold and owes a `recovered` event on success. */
   private reconciliationAnnounced = false;
   private reviewerDegraded = false;
+  private reviewerConsecutiveFailures = 0;
+  private reviewerAnnounced = false;
   private lastReviewAtMs: number | undefined;
   private workingSinceMs: number | undefined;
   /** Increments on each entry into `working`, so a review can prove it is still reviewing its own run. */
@@ -1853,10 +1858,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /**
    * Review a child that has been working for a whole cadence. A reviewer
    * infrastructure failure is silent — it normalizes to the unavailable
-   * result and retries at the next cadence (ADR-036 V2-08); an evidence-read
-   * or telemetry-sink failure instead enters one visible degraded episode,
-   * and the first success afterwards notifies recovery once. The supervisor
-   * stays active either way.
+   * result and retries at the next cadence (ADR-036 V2-08). Evidence-read
+   * and telemetry-sink failures degrade the view immediately, but announce
+   * only a sustained episode. Recovery requires a complete cadence, including
+   * its durable append, and only an announced episode owes a recovery event.
+   * The supervisor stays active either way.
    */
   private async review(): Promise<void> {
     if (this.reviewing || this.pendingMoveDestination !== undefined || this.reviewsPaused) {
@@ -1880,6 +1886,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const paneIdentity = this.paneIdentityGeneration;
     const reviewed = this.identity!;
     const workingSinceMs = this.workingSinceMs!;
+    let completed = false;
     try {
       // Evidence order (ADR-036): the runner's own structured trace is the
       // primary "what happened"; the bounded terminal read is supplemental
@@ -1931,6 +1938,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         // cursor advance already happened, so a sink failure costs only the
         // dataset rows and degrades like a reviewer failure.
         await this.persistTier0Violations(violations, reviewed, trace, workspace, build);
+        completed = true;
         return;
       }
       // A source that failed closed, or a state the budget/scan gate refused,
@@ -1987,10 +1995,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         traceFromCursor: digestCursorLabel(build.state.trace.cursorFrom),
         traceToCursor: digestCursorLabel(build.state.trace.cursorTo),
       };
-      if (this.reviewerDegraded) {
-        this.reviewerDegraded = false;
-        this.emit("reviewer_recovered", "the supervision reviewer recovered");
-      }
       let wake: SupervisionEvent | undefined;
       // The code-owned ADR-036 attention policy decides, never the
       // classification's legacy table: the result carries the decision, and
@@ -2015,7 +2019,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         // Progress stores silently.
         this.publish(`review ${result.classification}: ${result.summary}`);
       }
-      // The durable append runs strictly last: the in-memory record, the
+      // The durable append follows the review effects: the in-memory record, the
       // watermark, the temporal memory, and the wake itself all already
       // happened, so a failed write loses only the dataset row and degrades
       // exactly like a reviewer failure (one reported episode, retry next
@@ -2027,6 +2031,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         stateBytes: build.bytes.total,
         terminalBytes: build.bytes.terminal,
       });
+      completed = result.outcome !== "reviewer_unavailable";
     } catch (error) {
       // A failure that belongs to a run which has already ended, or to a pane the
       // child has left, is not evidence about anything either: it must not
@@ -2043,13 +2048,26 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.publish(`review unavailable (${reviewerReason(error)})`);
         return;
       }
-      if (!this.reviewerDegraded) {
-        this.reviewerDegraded = true;
+      this.reviewerDegraded = true;
+      this.reviewerConsecutiveFailures += 1;
+      if (!this.reviewerAnnounced && this.reviewerConsecutiveFailures >= SUPERVISION_REVIEWER_DEGRADED_EVENT_THRESHOLD) {
+        this.reviewerAnnounced = true;
         this.emit("reviewer_degraded", `the supervision reviewer failed (${reviewerReason(error)}) and will retry at the next cadence`, { reason: reviewerReason(error) });
       } else {
-        this.publish(`review failed again (${reviewerReason(error)})`);
+        this.publish(`review failed (${reviewerReason(error)})`);
       }
     } finally {
+      // Judge the whole cadence once. A successful model call followed by a
+      // failed append is still degraded, not a recovered/degraded pair. An
+      // unavailable or obsolete cadence cannot prove recovery either.
+      if (completed && this.reviewable(run, paneIdentity)) {
+        this.reviewerDegraded = false;
+        this.reviewerConsecutiveFailures = 0;
+        if (this.reviewerAnnounced) {
+          this.reviewerAnnounced = false;
+          this.emit("reviewer_recovered", "the supervision reviewer recovered");
+        }
+      }
       this.reviewing = false;
       // Only the run this review belonged to may re-arm. A newer run already
       // armed its own cadence when it began, and clearing that here would delay
@@ -2060,9 +2078,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   /**
    * Persist one completed review — and the wake's pending disposition entry
-   * when it woke the manager — to the durable review log. Runs strictly after
-   * every supervision effect so a sink failure can only ever cost the dataset
-   * row itself; the caller's catch degrades it like a reviewer failure.
+   * when it woke the manager — to the durable review log. Runs after review
+   * effects but before declaring recovery: a sink failure costs the dataset
+   * row, not the review or its attention wake, and keeps the cadence degraded.
    */
   private async persistReview(
     result: SupervisionReviewResult,

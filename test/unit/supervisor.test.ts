@@ -239,6 +239,9 @@ function harness(options: HarnessOptions = {}): Harness {
 
 const types = (wakes: SupervisionWake[]): string[] => wakes.map((wake) => wake.event.type);
 
+/** Await the entire cadence, including the append that runs after the model returns. */
+const reviewTick = (h: Harness): Promise<void> => (h.supervisor as unknown as { review(): Promise<void> }).review();
+
 function agyExactSnapshot(overrides: Record<string, unknown> = {}): HerdrSnapshot {
   const record = { agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5, ...overrides };
   return snapshot([agyPaneRecord(record)], [agyAgentRecord(record)]);
@@ -2377,33 +2380,37 @@ describe("supervisor review cadence", () => {
     expect(h.wakes).toEqual([]);
   });
 
-  it("still degrades once for a non-reviewer failure — an evidence read — and notifies recovery once", async () => {
-    // The silent path is reviewer infrastructure only: a transcript read that
-    // throws is an evidence failure, which still opens one degraded episode —
-    // a repeat failure inside it republishes locally instead of waking again.
+  it("announces a sustained evidence-read outage once and notifies recovery once", async () => {
     let transcriptCalls = 0;
     const h = await working({
-      transcript: async () => { if (transcriptCalls++ < 2) throw new Error("pane read failed"); return ["line"]; },
-      review: async () => ({ classification: "progress", summary: "moving" }),
+      transcript: async () => { if (transcriptCalls++ < 4) throw new Error("pane read failed"); return ["line"]; },
     });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
-    expect(h.supervisor.view().reviewer.degraded).toBe(true);
-    expect(h.reviews).toBe(0);
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review failed again"))).toBe(true));
-    expect(types(h.wakes)).toEqual(["reviewer_degraded"]);
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    for (let tick = 1; tick <= 4; tick += 1) {
+      await reviewTick(h);
+      expect(h.supervisor.view().reviewer.degraded).toBe(true);
+      expect(h.reviews).toBe(0);
+      expect(types(h.wakes)).toEqual(tick < 3 ? [] : ["reviewer_degraded"]);
+      expect(h.timerArmed()).toBe(true);
+    }
+    await reviewTick(h);
+    await reviewTick(h);
     expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_recovered"]);
     expect(h.supervisor.view().reviewer.degraded).toBe(false);
   });
 
-  it("treats an unreadable transcript as an evidence-read failure that degrades — not a silent reviewer failure", async () => {
-    const h = await working({ transcript: async () => { throw new Error("pane read failed"); } });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
-    expect(h.reviews).toBe(0);
+  it("keeps intermittent evidence-read failures and their recoveries view-only", async () => {
+    let fail = true;
+    const h = await working({ transcript: async () => { if (fail) throw new Error("pane read failed"); return ["line"]; } });
+    for (let episode = 0; episode < 2; episode += 1) {
+      fail = true;
+      await reviewTick(h);
+      await reviewTick(h);
+      expect(h.supervisor.view().reviewer.degraded).toBe(true);
+      fail = false;
+      await reviewTick(h);
+      expect(h.supervisor.view().reviewer.degraded).toBe(false);
+    }
+    expect(h.wakes).toEqual([]);
   });
 
   it("does not review a child that stopped working or a settled supervisor", async () => {
@@ -2760,10 +2767,13 @@ describe("supervisor review cadence", () => {
         entries.push(entry);
       },
     });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
-    // The review still completed and stored; only the dataset row was lost.
-    expect(h.supervisor.view().reviewer.reviews).toHaveLength(1);
+    await reviewTick(h);
+    await reviewTick(h);
+    expect(h.wakes).toEqual([]);
+    await reviewTick(h);
+    expect(types(h.wakes)).toEqual(["reviewer_degraded"]);
+    // The reviews still completed and stored; only the dataset rows were lost.
+    expect(h.supervisor.view().reviewer.reviews).toHaveLength(3);
     expect(h.supervisor.view().reviewer.degraded).toBe(true);
     expect(h.supervisor.childLive()).toBe(true);
     expect(h.timerArmed()).toBe(true);
@@ -2775,13 +2785,80 @@ describe("supervisor review cadence", () => {
     expect(h.supervisor.view().reviewer.degraded).toBe(false);
   });
 
+  it("does not emit a recovered/degraded pair when consecutive Claude review-log appends fail", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", agentKind: "claude", agentSession: claudeSession })])],
+      reviewLog: async () => { throw new ReviewLogError(); },
+    });
+    await h.supervisor.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
+    await reviewTick(h);
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    const before = h.wakes.length;
+    await reviewTick(h);
+    expect(h.reviews).toBe(2);
+    expect(h.reviewRequests[1]!.evidence.trace.source).toBe("tmux-fallback");
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    expect(types(h.wakes.slice(before))).toEqual([]);
+    h.supervisor.shutdown();
+  });
+
+  it.each([false, true])("waits for a complete, live append before recovery (obsolete=%s)", async (obsolete) => {
+    let calls = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const h = await working({
+      reviewLog: async () => { if (++calls <= 3) throw new ReviewLogError(); await pending; },
+    });
+    for (let tick = 0; tick < 3; tick += 1) await reviewTick(h);
+    const inFlight = reviewTick(h);
+    await vi.waitFor(() => expect(calls).toBe(4));
+    expect(types(h.wakes)).toEqual(["reviewer_degraded"]);
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    if (obsolete) await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    release();
+    await inFlight;
+    expect(h.supervisor.view().reviewer.degraded).toBe(obsolete);
+    expect(types(h.wakes)).toEqual(obsolete ? ["reviewer_degraded", "work_cycle_completed"] : ["reviewer_degraded", "reviewer_recovered"]);
+    h.supervisor.shutdown();
+  });
+
+  it("does not mistake unavailable cadences for recovery from a sustained log outage", async () => {
+    let phase = "log";
+    const h = await working({
+      reviewLog: async () => { if (phase === "log") throw new ReviewLogError(); },
+      review: async () => {
+        if (phase === "throw") throw new ReviewerFailure("unavailable");
+        return phase === "result"
+          ? { classification: "unknown", summary: "unavailable", outcome: "reviewer_unavailable" }
+          : { classification: "progress", summary: "moving" };
+      },
+      evidenceScanner: () => ({ outcome: phase === "scan" ? "indeterminate" : "safe" }),
+      traceSource: createTraceSource({
+        readFileRange: async () => { if (phase === "trace") throw new Error("unreadable"); return new Uint8Array(); },
+      }),
+    });
+    for (let tick = 0; tick < 3; tick += 1) await reviewTick(h);
+    for (phase of ["throw", "result", "scan", "trace"]) {
+      await reviewTick(h);
+      expect(h.supervisor.view().reviewer.degraded).toBe(true);
+      expect(types(h.wakes)).toEqual(["reviewer_degraded"]);
+    }
+    phase = "healthy";
+    await reviewTick(h);
+    expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_recovered"]);
+    expect(h.supervisor.view().reviewer.degraded).toBe(false);
+  });
+
   it("still wakes the manager when an attention review's log write fails", async () => {
     const h = await working({
       review: async () => ({ classification: "stalled", summary: "no output" }),
       reviewLog: async () => { throw new ReviewLogError(); },
     });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
+    await reviewTick(h);
+    expect(types(h.wakes)).toEqual(["reviewer_attention"]);
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
     expect(h.supervisor.view().reviewer.reviews).toHaveLength(1);
     expect(h.supervisor.childLive()).toBe(true);
   });
@@ -3590,11 +3667,10 @@ describe("the ADR-036 evidence cadence", () => {
     }
   });
 
-  it("degrades like a reviewer failure when a violation's log write fails — the wake already fired and the child is untouched", async () => {
+  it.each([false, true])("recovers from a violation log outage only after a persisted cadence (still violating=%s)", async (stillViolating) => {
     const persisted: SupervisionLogEntry[] = [];
     let fail = true;
-    // The violation source is a read-only reservation whose workspace is
-    // dirty on the first cadence and clean on the recovery cadence.
+    // Recovery can come from a normal review or a persisted Tier-0 violation.
     let workspaceDirty = true;
     const h = await working({
       assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
@@ -3602,18 +3678,22 @@ describe("the ADR-036 evidence cadence", () => {
       workspaceRunner: async (argv, cwd, signal) => (workspaceDirty ? dirtyRunner : cleanRunner)(argv, cwd, signal),
       reviewLog: async (entry) => { if (fail) throw new ReviewLogError(); persisted.push(entry); },
     });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
+    await reviewTick(h);
+    await reviewTick(h);
+    await reviewTick(h);
+    expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_attention", "reviewer_attention", "reviewer_degraded"]);
     expect(h.reviews).toBe(0);
     expect(h.supervisor.view().reviewer.degraded).toBe(true);
     expect(h.supervisor.childLive()).toBe(true);
     expect(h.timerArmed()).toBe(true);
-    // The next cadence retries the sink; a clean window reviews normally and
-    // the recovered reviewer emits the recovery wake.
     fail = false;
-    workspaceDirty = false;
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded", "reviewer_recovered"]));
+    workspaceDirty = stillViolating;
+    await reviewTick(h);
+    expect(types(h.wakes)).toEqual([
+      "reviewer_attention", "reviewer_attention", "reviewer_attention", "reviewer_degraded",
+      ...(stillViolating ? ["reviewer_attention"] : []), "reviewer_recovered",
+    ]);
+    expect(h.supervisor.view().reviewer.degraded).toBe(false);
     expect(persisted).toHaveLength(1);
   });
 

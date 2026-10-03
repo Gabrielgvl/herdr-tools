@@ -314,8 +314,8 @@ Material wakes, each with an opaque `eventId`:
 | `work_cycle_completed` | `working` → `idle` or `done` | normal |
 | `blocked` | any → `blocked` | high |
 | `reviewer_attention` | reviewer says `stalled`/`blocked`/`risk`/`appears_complete`/`unknown` | high |
-| `reviewer_degraded` | reviewer call failed, first failure of a degraded episode | normal |
-| `reviewer_recovered` | first success after a degraded episode | normal |
+| `reviewer_degraded` | third consecutive failed cadence due to evidence-read or review-sink failure; once per episode | normal |
+| `reviewer_recovered` | first complete, persisted, still-live cadence after an announced degraded episode; once per episode | normal |
 | `identity_replaced` | continuity broken with a live replacement occupant | high |
 | `identity_lost` | continuity broken with no provable occupant | high |
 | `released` | agent released / `pane_exited` confirmed by snapshot | normal |
@@ -375,8 +375,13 @@ supervisor job settles immediately after the wake.
   `appears_complete`, and `unknown` wake the manager, and the supervisor stays active.
 - Reviewer infrastructure failure, including transport, authentication, HTTP, or malformed
   response, is silent and retries at the next cadence. Evidence-read and review-sink failures
-  enter one visible `reviewer_degraded` episode; the first later successful cadence emits one
-  `reviewer_recovered` wake.
+  degrade the job view immediately, but announce `reviewer_degraded` only on the third
+  consecutive failed cadence. Further failures in that episode emit no additional wake.
+  Recovery requires a complete, persisted, still-live cadence, including a successful review
+  or Tier-0 violation log append. Only an announced episode emits one `reviewer_recovered`
+  wake; an episode that recovers before announcement owes no recovery wake. A successful
+  model call followed by a failed append is not recovery, and unavailable or obsolete cadences
+  cannot prove recovery. No cadence emits a recovered/degraded pair.
 - The reviewer never starts a Herdr agent and never creates a pane.
 - Reviews are bounded to `SUPERVISION_MAX_REVIEWS = 24` with a `truncatedReviews` count.
 

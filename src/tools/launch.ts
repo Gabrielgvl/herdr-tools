@@ -2605,6 +2605,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           settings: {
             supervisionDigest,
             workspaceRoot: supervisionWorkspaceRoot(launchCwd),
+            // The review log anchors on the launch's trusted project root —
+            // the daemon's verified projectRoot or the host context's cwd —
+            // never on whatever directory the supervising process happens to
+            // run from. Daemon-hosted supervision requires it explicitly.
+            reviewLogRoot: deps.cwd ?? ctx.cwd,
             ...(deps.eventWriter === undefined ? {} : { eventWriter: deps.eventWriter })
           }
         });

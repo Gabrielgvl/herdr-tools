@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -123,6 +124,8 @@ interface HarnessOptions {
   reviewLog?: SupervisorDependencies["reviewLog"] | "default";
   /** The trusted root the default seam appends under. */
   reviewLogRoot?: string;
+  /** Daemon-hosted supervision: no ambient anchor — a missing `reviewLogRoot` fails appends closed. */
+  daemonHosted?: boolean;
   /** Pi session-JSONL bytes the default file reader serves. */
   traceFile?: string | Uint8Array;
   /** Full trace-source override; the default wires the real source against `traceFile`/`devinSession`. */
@@ -196,6 +199,7 @@ function harness(options: HarnessOptions = {}): Harness {
     ...(options.assignmentDigest === undefined ? {} : { assignmentDigest: options.assignmentDigest }),
     ...(options.reviewLog === "default" ? {} : { reviewLog: options.reviewLog ?? (async (entry: SupervisionLogEntry) => { logged.push(entry); }) }),
     ...(options.reviewLogRoot === undefined ? {} : { reviewLogRoot: options.reviewLogRoot }),
+    ...(options.daemonHosted === true ? { daemonHosted: true } : {}),
     cadenceMs: options.cadenceMs ?? 300_000,
     clock: options.clock ?? { now: () => 1_000 },
     ...(options.eventWriter === undefined ? {} : { eventWriter: options.eventWriter }),
@@ -2916,6 +2920,94 @@ describe("supervisor review cadence", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("keeps the explicit root authoritative on a daemon-hosted supervisor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-daemon-"));
+    try {
+      const h = harness({
+        reviewLog: "default",
+        daemonHosted: true,
+        reviewLogRoot: root,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 9 })])],
+        review: async () => ({ classification: "stalled", summary: "no output" }),
+      });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 9 });
+      h.fireTimer();
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+      const paths = reviewLogPaths(root);
+      await vi.waitFor(async () => {
+        const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as SupervisionLogRecord);
+        expect(records).toHaveLength(2);
+        expect(records[0]).toMatchObject({ type: "review", jobId: "job_supervisor", classification: "stalled", attention: true });
+        expect(records[1]).toMatchObject({ type: "wake", disposition: "unknown" });
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a rootless daemon-hosted supervisor fails every append closed — nothing lands under the process cwd", async () => {
+    // A disposable ambient cwd: the no-write assertions must hold regardless
+    // of what .herdr state the real checkout happens to carry.
+    const cwd = await mkdtemp(join(tmpdir(), "herdr-supervisor-cwd-"));
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      const h = harness({
+        reviewLog: "default",
+        daemonHosted: true,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 9 })])],
+        review: async () => ({ classification: "stalled", summary: "no output" }),
+      });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 9 });
+      // Every cadence still completes its review and attention wake; each refused
+      // append degrades like a reviewer failure, and the damped policy announces
+      // a single reviewer_degraded only on the third consecutive refusal.
+      for (let tick = 1; tick <= 3; tick += 1) {
+        await reviewTick(h);
+        expect(h.reviews).toBe(tick);
+        expect(h.supervisor.view().reviewer.degraded).toBe(true);
+        expect(h.wakes.filter((wake) => wake.event.type === "reviewer_degraded")).toHaveLength(tick < 3 ? 0 : 1);
+      }
+      expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_attention", "reviewer_attention", "reviewer_degraded"]);
+      // Every refusal failed closed: the silent ticks reported
+      // REVIEW_LOG_UNAVAILABLE and so did the announced event's reason.
+      expect(h.progress.filter((line) => line === "review failed (REVIEW_LOG_UNAVAILABLE)")).toHaveLength(2);
+      expect(h.wakes[3]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
+      // The root resolution refused before any filesystem touch: no directory,
+      // no lock, no file was created under the supervising process's cwd.
+      const cwdPaths = reviewLogPaths(cwd);
+      expect(existsSync(cwdPaths.directory)).toBe(false);
+      expect(existsSync(cwdPaths.reviews)).toBe(false);
+      h.supervisor.shutdown();
+    } finally {
+      cwdSpy.mockRestore();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a rootless non-daemon supervisor on HERDR_PROJECT_DIR — the in-process harness path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-envroot-"));
+    vi.stubEnv("HERDR_PROJECT_DIR", root);
+    try {
+      const h = harness({
+        reviewLog: "default",
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 9 })])],
+        review: async () => ({ classification: "stalled", summary: "no output" }),
+      });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 9 });
+      h.fireTimer();
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+      const paths = reviewLogPaths(root);
+      await vi.waitFor(async () => {
+        const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0);
+        expect(records).toHaveLength(2);
+      });
+      h.supervisor.shutdown();
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("the ADR-036 evidence cadence", () => {
@@ -3664,6 +3756,40 @@ describe("the ADR-036 evidence cadence", () => {
       expect((await lstat(paths.reviews)).mode & 0o777).toBe(0o600);
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a rootless daemon-hosted supervisor refuses the violation append closed — nothing lands under the process cwd", async () => {
+    // A disposable ambient cwd: the no-write assertions must hold regardless
+    // of what .herdr state the real checkout happens to carry.
+    const cwd = await mkdtemp(join(tmpdir(), "herdr-supervisor-viocwd-"));
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      // The same read-only-over-dirty violation the disk test persists — but
+      // this daemon-hosted reservation supplies no root, so the append must
+      // refuse before any filesystem touch rather than anchor on the ambient
+      // cwd.
+      const h = await working({
+        reviewLog: "default",
+        daemonHosted: true,
+        assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+        workspaceRoot,
+        workspaceRunner: dirtyRunner,
+      });
+      await reviewTick(h);
+      // The deterministic violation still woke the manager; only the durable
+      // append refused, degrading the cadence exactly like a reviewer failure.
+      expect(types(h.wakes)).toEqual(["reviewer_attention"]);
+      expect(h.wakes[0]!.event).toMatchObject({ details: { violation: "read_only_dirty_workspace" } });
+      expect(h.supervisor.view().reviewer.degraded).toBe(true);
+      expect(h.progress.filter((line) => line === "review failed (REVIEW_LOG_UNAVAILABLE)")).toHaveLength(1);
+      const cwdPaths = reviewLogPaths(cwd);
+      expect(existsSync(cwdPaths.directory)).toBe(false);
+      expect(existsSync(cwdPaths.reviews)).toBe(false);
+      h.supervisor.shutdown();
+    } finally {
+      cwdSpy.mockRestore();
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 

@@ -273,6 +273,9 @@ describe("createSharedRuntime", () => {
     expect(wired).toMatchObject({ cli: runtime.cli, queueFlush: runtime.queueFlush });
     expect(runtime.jobs).toBe(jobs);
     expect(runtime.supervision).toBeInstanceOf(SupervisionRegistry);
+    // An in-process assembly keeps the ambient review-log anchor — only the
+    // daemon requires an explicit root.
+    expect((runtime.supervision as unknown as { deps: { daemonHosted?: boolean } }).deps.daemonHosted).toBeUndefined();
     expect(runtime.ownership).toBeInstanceOf(RuntimeOwnership);
     expect(typeof runtime.handoffs.bind).toBe("function");
     expect(typeof runtime.queueFlush.writeSection).toBe("function");
@@ -305,6 +308,10 @@ describe("createDaemonRuntime", () => {
     expect(runtime.allocator).toBe(allocator);
     expect(runtime.launchDeps).toBe(launchDeps);
     expect(runtime.inflight.size).toBe(0);
+    // Daemon-hosted supervision: the registry requires an explicit
+    // reviewLogRoot on every reservation — the daemon's own cwd is never a
+    // project anchor.
+    expect((runtime.supervision as unknown as { deps: { daemonHosted?: boolean } }).deps.daemonHosted).toBe(true);
   });
 
   it("shares the own-close ledger with host override, and the default registry consults the bound retirer before suppressing a handed_off terminal", async () => {

@@ -94,6 +94,16 @@ export interface SupervisionRegistryDependencies {
   hints?: IdleHintSink;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
+  /**
+   * Daemon-hosted supervision (the durable daemon's assembly): the host
+   * process's own cwd and env were never verified as a project anchor, so
+   * every reservation must carry an explicit `settings.reviewLogRoot`. A
+   * rootless reservation still reserves — telemetry is not a launch
+   * precondition — but its supervisor's appends fail closed instead of
+   * writing under the daemon's directory. Forwarded verbatim to every
+   * reserved supervisor.
+   */
+  daemonHosted?: boolean;
   /** The reserve-time and cadence workspace command seam. */
   workspaceRunner?: WorkspaceCommandRunner;
   idFactory?: () => string;
@@ -109,10 +119,13 @@ export interface SupervisionReservationSettings {
   /** The trusted launch workspace root the workspace evidence reads; never the supervisor's own cwd. */
   workspaceRoot?: SupervisionWorkspaceRoot;
   /**
-   * The trusted root the review log appends under (D4/N2.3). Reattached runs
-   * pass the verified project root or the endpoint namespace; absent keeps the
-   * host's `HERDR_PROJECT_DIR`/cwd anchor. Never part of the job snapshot —
-   * it is a trusted-path seam, not request evidence.
+   * The trusted root the review log appends under (D4/N2.3). Fresh launches
+   * pass the launch's verified project root; reattached runs pass the
+   * recorded one or the endpoint namespace. Absent keeps the host's
+   * `HERDR_PROJECT_DIR`/cwd anchor — which a daemon-hosted registry does not
+   * have, so a rootless daemon reservation fails its appends closed. Never
+   * part of the job snapshot — it is a trusted-path seam, not request
+   * evidence.
    */
   reviewLogRoot?: string;
   /**
@@ -237,6 +250,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         ...(supervisionDigest === undefined ? {} : { assignmentDigest: supervisionDigest }),
         ...(request.settings?.workspaceRoot === undefined ? {} : { workspaceRoot: request.settings.workspaceRoot }),
         ...(request.settings?.reviewLogRoot === undefined ? {} : { reviewLogRoot: request.settings.reviewLogRoot }),
+        ...(this.deps.daemonHosted === true ? { daemonHosted: true } : {}),
         ...(request.settings?.eventWriter === undefined ? {} : { eventWriter: request.settings.eventWriter }),
         ...(workspaceBase === undefined ? {} : { workspaceBase }),
         workspaceRunner: this.workspaceRunner,

@@ -2955,10 +2955,20 @@ describe("supervisor review cadence", () => {
       review: async () => ({ classification: "stalled", summary: "no output" }),
     });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 9 });
-    h.fireTimer();
-    // The wake still fired; the refused append degrades like a reviewer failure.
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
-    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    // Every cadence still completes its review and attention wake; each refused
+    // append degrades like a reviewer failure, and the damped policy announces
+    // a single reviewer_degraded only on the third consecutive refusal.
+    for (let tick = 1; tick <= 3; tick += 1) {
+      await reviewTick(h);
+      expect(h.reviews).toBe(tick);
+      expect(h.supervisor.view().reviewer.degraded).toBe(true);
+      expect(h.wakes.filter((wake) => wake.event.type === "reviewer_degraded")).toHaveLength(tick < 3 ? 0 : 1);
+    }
+    expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_attention", "reviewer_attention", "reviewer_degraded"]);
+    // Every refusal failed closed: the silent ticks reported
+    // REVIEW_LOG_UNAVAILABLE and so did the announced event's reason.
+    expect(h.progress.filter((line) => line === "review failed (REVIEW_LOG_UNAVAILABLE)")).toHaveLength(2);
+    expect(h.wakes[3]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
     // The root resolution refused before any filesystem touch: no directory,
     // no lock, no file was created under the supervising process's cwd.
     expect(existsSync(cwdPaths.directory)).toBe(false);

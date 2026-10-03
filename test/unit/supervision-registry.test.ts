@@ -485,8 +485,18 @@ describe("the supervision registry", () => {
     const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" } });
     await reservation.bind({ identity: { ...identity, agentKind: "claude", agentSession: claudeSession }, operatingPointId: "worker-claude" });
     expect(typeof cadence).toBe("function");
-    cadence!();
-    await vi.waitFor(() => expect(wakes.map((wake) => wake.event.type)).toEqual(["reviewer_degraded"]));
+    // Each cadence's refused append degrades the view immediately; the damped
+    // policy announces reviewer_degraded only on the third consecutive refusal.
+    // Waiting on the review count outlives the whole cadence — degraded was
+    // already true from the first refusal, so it cannot mark a tick's end.
+    for (let tick = 1; tick <= 3; tick += 1) {
+      cadence!();
+      await vi.waitFor(() => expect(jobs.get(reservation.jobId)?.supervision?.reviewer.reviews).toHaveLength(tick));
+      expect(jobs.get(reservation.jobId)?.supervision?.reviewer.degraded).toBe(true);
+      expect(wakes.map((wake) => wake.event.type)).toEqual(tick < 3 ? [] : ["reviewer_degraded"]);
+    }
+    // Three reviews completed and every append was refused closed.
+    expect(wakes[0]!.event).toMatchObject({ type: "reviewer_degraded", details: { reason: "REVIEW_LOG_UNAVAILABLE" } });
     const cwdPaths = reviewLogPaths(process.cwd());
     expect(existsSync(cwdPaths.directory)).toBe(false);
     expect(existsSync(cwdPaths.reviews)).toBe(false);

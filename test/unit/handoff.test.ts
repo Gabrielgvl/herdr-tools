@@ -587,6 +587,17 @@ describe("provenance record", () => {
     expect((await readHandoffProvenance(plain)).task).not.toHaveProperty("retention");
   });
 
+  it("round-trips the operatingPoint field, omitted absent", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const explicit = await allocator.allocate();
+    await allocator.persist(explicit, provenanceIdentity, { managerSession: null, task: { ...taskContract, operatingPoint: "pi:openai-codex/gpt-6-luna:low" } });
+    expect((await readHandoffProvenance(explicit)).task.operatingPoint).toBe("pi:openai-codex/gpt-6-luna:low");
+    const plain = await allocator.allocate();
+    await allocator.persist(plain, provenanceIdentity, { managerSession: null, task: taskContract });
+    expect((await readHandoffProvenance(plain)).task).not.toHaveProperty("operatingPoint");
+  });
+
   it("refuses malformed provenance input before the run directory exists", async () => {
     const dir = await root();
     const allocator = allocatorFor(dir);
@@ -606,6 +617,10 @@ describe("provenance record", () => {
       { managerSession, task: { ...taskContract, objective: "has\0nul" } },
       { managerSession, task: { ...taskContract, retention: "park" as never } },
       { managerSession, task: { ...taskContract, retention: 1 as never } },
+      { managerSession, task: { ...taskContract, operatingPoint: "" } },
+      { managerSession, task: { ...taskContract, operatingPoint: "has\nline" } },
+      { managerSession, task: { ...taskContract, operatingPoint: "x".repeat(129) } },
+      { managerSession, task: { ...taskContract, operatingPoint: 5 } as never },
     ];
     for (const [index, input] of badInputs.entries()) {
       const attempt = await allocator.allocate();
@@ -717,6 +732,8 @@ describe("provenance record", () => {
       (doc) => { doc.task = { ...originalTask, recoveryOf: "not-a-run" }; },
       (doc) => { doc.task = { ...originalTask, label: 5 }; },
       (doc) => { doc.task = { ...originalTask, retention: "park" }; },
+      (doc) => { doc.task = { ...originalTask, operatingPoint: "has\nline" }; },
+      (doc) => { doc.task = { ...originalTask, operatingPoint: "x".repeat(129) }; },
       (doc) => { doc.task = { ...originalTask, foreign: true }; },
       (doc) => { delete doc.task; },
       (doc) => { doc.foreign = true; },

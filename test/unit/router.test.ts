@@ -286,4 +286,49 @@ describe("tier-chain routing", () => {
     await expect(routeTask(withoutCount)).resolves.toMatchObject({ kind: "admitted", count: 1 });
     expect(options).toHaveBeenCalled();
   });
+
+  it("admits an exact post-gate operatingPoint as the whole chain", async () => {
+    const result = await routeTask(input({ operatingPoint: "claude:s2:low" }));
+    expect(result).toMatchObject({
+      kind: "admitted",
+      chain: ["claude:s2:low"],
+      selectedPoint: { id: "claude:s2:low", index: 0 },
+      configuration: { candidate: { id: "claude:s2:low" } },
+    });
+  });
+
+  it("refuses an explicit operatingPoint absent from the surviving admissible set", async () => {
+    const refused = { kind: "abstained", reason: "no_candidates_at_tier", component: "operatingPoint" } as const;
+    // An unknown id.
+    await expect(routeTask(input({ operatingPoint: "pi:unknown:low" }))).resolves.toMatchObject(refused);
+    // A point below the workload floor's admissible union.
+    await expect(routeTask(input({ operatingPoint: "pi:u:low" }))).resolves.toMatchObject(refused);
+    // A point below the start an explicit-tier raise produced.
+    await expect(routeTask(input({ task: { ...TASK, tier: "strong" }, operatingPoint: "devin:e" }))).resolves.toMatchObject(refused);
+    // Excluded by recovery lineage while other points survive.
+    await expect(routeTask(input({ recovery: { priorOperatingPointId: "pi:s:low", priorRouteTier: "economy" }, operatingPoint: "pi:s:low" }))).resolves.toMatchObject(refused);
+    // Probed known-exhausted.
+    await expect(routeTask(input({ operatingPoint: "pi:s:low", availability: async ({ model }) => status(model === "s" ? "known-exhausted" : "unknown") }))).resolves.toMatchObject(refused);
+    // Skipped without a probe as an exhausted quota sibling.
+    const sibling = catalog(POINTS.map((entry) => entry.id === "pi:f:low" ? { ...entry, quota: { ...POINTS[2]!.quota }, provider: POINTS[2]!.provider } : entry));
+    await expect(routeTask(input({ catalog: sibling, operatingPoint: "pi:f:low", availability: async ({ model }) => status(model === "s" ? "known-exhausted" : "unknown") }))).resolves.toMatchObject(refused);
+  });
+
+  it("keeps the original early-refusal shapes when an explicit operatingPoint is set", async () => {
+    // Recovery emptying the candidate set refuses before selection runs.
+    const one = point("pi:s:low", "pi", "s", "p-s");
+    const only = catalog([one]);
+    only.tierChains = { utility: [], economy: [], standard: [one.id], strong: [], frontier: [], max: [] };
+    const candidatesEmpty = await routeTask(input({ catalog: only, recovery: { priorOperatingPointId: one.id, priorRouteTier: "economy" }, operatingPoint: "claude:m:low" }));
+    expect(candidatesEmpty).toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    expect(candidatesEmpty).not.toHaveProperty("component");
+    expect(candidatesEmpty).not.toHaveProperty("selectedPoint");
+    // Total quota exhaustion keeps its refusal shape.
+    const exhausted = await routeTask(input({ availability: async () => status("known-exhausted"), operatingPoint: "claude:m:low" }));
+    expect(exhausted).toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    expect(exhausted).not.toHaveProperty("component");
+    expect(exhausted).not.toHaveProperty("selectedPoint");
+    // Total local-capacity exhaustion stays transport_failed/availability.
+    await expect(routeTask(input({ availability: async () => status("local-capacity-limited"), operatingPoint: "claude:m:low" }))).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
+  });
 });

@@ -452,6 +452,24 @@ describe("provider-limit auto-recovery", () => {
     expect(harness.live()).toHaveLength(1);
   });
 
+  it("never auto-recovers an explicit operatingPoint lane, even with proven zero progress", async () => {
+    const harness = makeCli();
+    const supervision = stubSupervision();
+    const recorder = vi.fn(async () => undefined);
+    const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: RESET_ISO, zeroProgressProven: true }));
+    const result = await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs: allocator(), availabilityFailureRecorder: recorder, claudeQuotaReader: quota }), { ...TASK, operatingPoint: "claude:c:low" });
+    expect(result.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "claude:c:low" });
+
+    // The manual contract stands: the cooldown is recorded and the wake fires,
+    // but an explicit point is never re-issued as an ordinary Task.
+    const signal = await supervision.completionSignals[0]!(supervision.bound[0]!.identity);
+    expect(signal).toEqual({ cooldownRecorded: true, retryNotBefore: RESET_ISO });
+    expect(recorder).toHaveBeenCalledTimes(1);
+    expect(harness.starts()).toBe(1);
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "close")).toEqual([]);
+    expect(harness.live()).toHaveLength(1);
+  });
+
   it("reports an unproven close without launching a second child", async () => {
     const harness = makeCli({ closeFailure: "present" });
     const supervision = stubSupervision();

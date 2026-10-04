@@ -91,7 +91,7 @@ describe("MCP input schema publication", () => {
     // The Task is a single strict object with the real requireds.
     expect(task.required).toEqual(expect.arrayContaining(["objective", "scope", "doneWhen"]));
     const taskProperties = record(task.properties);
-    for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "recoveryOf", "label", "cwd"]) {
+    for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "recoveryOf", "label", "cwd", "operatingPoint"]) {
       expect(taskProperties).toHaveProperty(field);
     }
     // The deleted caller-authority fields have no alias at the boundary —

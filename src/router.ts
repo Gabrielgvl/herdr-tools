@@ -168,6 +168,8 @@ export interface TaskRouteInput {
    * which carries no task-difficulty signal and keeps the prior route tier.
    */
   recovery?: { priorOperatingPointId: string; priorRouteTier: QualityTier; priorFailureCause?: "provider_limit" };
+  /** Exact requested point: selected only from the gated `available` set, else refused; the chain is that point alone. */
+  operatingPoint?: string;
 }
 
 interface ParsedBinary { probability: number; confidence: number }
@@ -346,7 +348,8 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
     });
   }
 
-  const point = available[0]!;
+  const point = input.operatingPoint === undefined ? available[0]! : available.find((member) => member.id === input.operatingPoint);
+  if (point === undefined) return abstain("no_candidates_at_tier", "operatingPoint", { ...evidenceBase, ...withExclusions(), availability: availabilityEvidence(statuses) });
   const runner = input.catalog.runners.get(point.runner)!;
   const selectedPoint: SelectedPoint = { index: 0, id: point.id, runner: point.runner, model: point.model, ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }) };
   const selection = runnerResourceSelection(response as TaskModelDecision, point.runner, runner);
@@ -366,7 +369,7 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
     workloadFloor: tier.value,
     effectiveStartTier: effectiveTier,
     effectiveCeiling: "max",
-    chain: available.map((member) => member.id),
+    chain: input.operatingPoint === undefined ? available.map((member) => member.id) : [point.id],
     selectedPoint,
     configuration,
     evidence: {

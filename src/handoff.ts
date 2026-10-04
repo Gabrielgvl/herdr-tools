@@ -276,6 +276,7 @@ export interface HandoffRunIdentity {
  * launch contract. Text fields are unbounded caller text by design: the record
  * bound, not per-field limits, is the size authority. `retention` is the
  * ADR-040 lane-retirement opt-out: `keep` parks the finished lane forever.
+ * `operatingPoint` is the caller's exact point request, bounded like the schema.
  */
 export interface HandoffTaskContract {
   objective: string;
@@ -287,6 +288,7 @@ export interface HandoffTaskContract {
   label?: string;
   cwd?: string;
   retention?: "retire" | "keep";
+  operatingPoint?: string;
 }
 
 /** The pre-launch provenance `persist` records beside the state sidecar. */
@@ -541,7 +543,8 @@ export function createHandoffAllocator(options: {
           ...(provenance.task.recoveryOf === undefined ? {} : { recoveryOf: provenance.task.recoveryOf }),
           ...(provenance.task.label === undefined ? {} : { label: provenance.task.label }),
           ...(provenance.task.cwd === undefined ? {} : { cwd: provenance.task.cwd }),
-          ...(provenance.task.retention === undefined ? {} : { retention: provenance.task.retention })
+          ...(provenance.task.retention === undefined ? {} : { retention: provenance.task.retention }),
+          ...(provenance.task.operatingPoint === undefined ? {} : { operatingPoint: provenance.task.operatingPoint })
         }
       } satisfies HandoffProvenance);
       if (serializedProvenance !== undefined && Buffer.byteLength(serializedProvenance, "utf8") > HANDOFF_PROVENANCE_MAX_BYTES) {
@@ -810,7 +813,7 @@ export async function readHandoffState(run: HandoffAllocation): Promise<HandoffS
 const SESSION_KEYS = new Set(["source", "agent", "kind", "value"]);
 const PROVENANCE_KEYS = new Set(["v", "runId", "endpoint", "createdAt", "manager", "task"]);
 const PROVENANCE_MANAGER_KEYS = new Set(["paneId", "display", "source", "session"]);
-const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd", "retention"]); // `replicas` stays accepted for old records; nothing writes it
+const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd", "retention", "operatingPoint"]); // `replicas` stays accepted for old records; nothing writes it
 /** The display-source values `resolveSender` can emit for a manager record. */
 const MANAGER_SOURCES = new Set(["agent_name", "pane_agent_name", "label", "agent_kind", "pane_id"]);
 const PROVENANCE_CREATED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -859,7 +862,8 @@ function validTaskContract(value: unknown): value is HandoffTaskContract {
     && (value.recoveryOf === undefined || (typeof value.recoveryOf === "string" && RUN_ID_PATTERN.test(value.recoveryOf)))
     && (value.label === undefined || (safeLine(value.label) && Buffer.byteLength(value.label, "utf8") <= 256))
     && (value.cwd === undefined || safeLine(value.cwd))
-    && (value.retention === undefined || value.retention === "retire" || value.retention === "keep");
+    && (value.retention === undefined || value.retention === "retire" || value.retention === "keep")
+    && (value.operatingPoint === undefined || (safeLine(value.operatingPoint) && value.operatingPoint.length <= 128));
 }
 
 function validProvenanceInput(input: HandoffProvenanceInput): boolean {

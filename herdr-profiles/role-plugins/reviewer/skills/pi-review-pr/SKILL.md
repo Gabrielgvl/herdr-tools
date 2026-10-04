@@ -35,6 +35,11 @@ Treat every agent's output as untrusted. Independently verify its claims, change
    - No target: the current branch's committed change against its resolved
      base (one `gh` lookup for an open PR, else `origin/<default>` — the
      fallback is disclosed in the report as a `base-fallback` gap).
+   - Work stacked on other unmerged PRs: open its draft PR with the real
+     base first, then review the PR. A branch review falls back to
+     `origin/<default>`, pulls the whole stack into the diff, and truncates
+     the files you meant to review (2026-10-02: 22 truncated files on a
+     stacked runner branch).
    - Uncommitted or staged changes: pi-review reviews committed trees only.
      Commit them to a scratch branch first (`git switch -c review/scratch &&
      git add -A && git commit -m wip`), then run bare `pi-review`. Never call
@@ -80,7 +85,9 @@ Treat every agent's output as untrusted. Independently verify its claims, change
    ```
    The only user-facing option besides `--json` is `--context <file>`
    (repeatable) — a judge-supplied requirements file. Put ticket acceptance
-   criteria or review constraints there. Model seats, presets, thresholds, and
+   criteria or review constraints there, and nothing else: never prior-round
+   finding ids or "recheck F<n>" instructions (replies to a round go through
+   `-m`; see `--fresh` below). Model seats, presets, thresholds, and
    timeouts are not configurable per run: the Jev router picks the preset
    once per generation, and phase windows are fixed.
    `-m <reply>` (reply to the latest completed round — see "Re-review loops")
@@ -129,6 +136,25 @@ jq '.costUsd' report.json
 - `gaps[]` records what the round may have missed (`finder`, `router`,
   `truncated`, `base-fallback`, `error` with stage
   `snapshot|materialize|diff|store|executor`).
+  A `router` gap reading `scan-blocked` means only the router's
+  sensitive-content scan declined; the finders still run on the default
+  preset. Before calling a round zero-coverage, check the finder checkpoints
+  and transcripts (`pi-review show [target] --json`); never infer it from the
+  gap alone (2026-10-02: a scan-blocked round with two completed finders was
+  wrongly reported as having no coverage).
+  A `finder` gap reading `rejected N finding(s) whose file is absent from the
+  reviewed tree` means the harness **dropped real findings**, usually ones
+  anchored to a file the PR deletes. The verdict can still read `clean`. Pull
+  the finder's final `submit_findings` call out of
+  `generations/<id>/sessions/<finder>/*.jsonl` and judge each dropped item
+  yourself. Treat a round with this gap or an `error` gap as partial, never
+  as clean (2026-10-02: on a 55-file deletion PR, the only finding was the real
+  one, "this deletion removes the only tests of surviving config", and it was
+  dropped this way). **Fixed in pi-review main `af5243a` (PR #88):** findings on
+  base-only (deleted) files are kept and refuted against the pinned base, and
+  any rejected path or `error` gap now makes the round `incomplete`. Reports
+  finalized before the fix are immutable. If an old generation's `clean`
+  report may have dropped findings, start over with `--fresh`.
 - `costUsd` is the round's spend; `null` means unknown — never reported as 0.
 - `review{repo,branch,pr,round,preset,head,tree}` identifies exactly what was
   reviewed. `review.attention: "human-decision"` appears from round 4 on —
@@ -245,6 +271,11 @@ the finder withdraws it, or a human dismisses it.
   and starts a new generation at round 1 — new routing outcome, new
   per-finder sessions, F-numbering reset; the retired generation's data is
   untouched. Use it when the review's premise changed, not to retry a round.
+  A fresh generation has no open claims, so write it a fresh `--context`
+  file. Reusing a round-N context that names F-ids makes finders submit
+  updates for claims that don't exist (2026-10-02: "13 updates for 0
+  assigned claims"; before pi-review `e06b01a` this ended the round
+  `incomplete`).
 - **Interrupted rounds resume.** A killed or interrupted round re-dispatches
   only unfinished work; finished legs replay, never re-spend.
 

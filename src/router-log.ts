@@ -86,6 +86,8 @@ export interface SpecRouterLogEntry {
   recoveryOf?: string;
   /** Recovery lineage: the failed operating point the chain excludes. */
   priorOperatingPointId?: string;
+  /** The caller's exact `operatingPoint` request, if any. */
+  requestedOperatingPoint?: string;
   state?: TaskRouterState | UnavailableRouterState;
   probabilities?: unknown;
 }
@@ -100,6 +102,8 @@ export interface RouterLogRecord {
   /** Recovery lineage pair — both null on ordinary routes, both set on recovery. */
   recoveryOf: string | null;
   priorOperatingPointId: string | null;
+  /** The caller's exact `operatingPoint` request; null when omitted. */
+  requestedOperatingPoint: string | null;
   stateDigest: string | null;
   stateUnavailable: { reason: "catalog_unavailable" } | null;
   probabilities: Record<string, unknown>;
@@ -538,10 +542,12 @@ function buildRecord(entry: SpecRouterLogEntry, now: () => Date): RouterLogRecor
   if ((recoveryOf === null) !== (priorOperatingPointId === null) || (recoveryOf !== null && !bounded(recoveryOf)) || (priorOperatingPointId !== null && !bounded(priorOperatingPointId))) {
     throw routerLogFailure("Router decision recovery lineage is untrusted");
   }
+  const requestedOperatingPoint = entry.requestedOperatingPoint === undefined ? null : entry.requestedOperatingPoint;
+  if (requestedOperatingPoint !== null && !bounded(requestedOperatingPoint)) throw routerLogFailure("Router decision requested operating point is untrusted");
   const result = projectSpecResult(entry.result);
   const evidence = projectEvidence(entry.evidence ?? entry.result.evidence);
   const probabilities = projectSpecProbabilities(entry.probabilities);
-  return { timestamp: now().toISOString(), name: caller, caller, binding, catalogRevision, recoveryOf, priorOperatingPointId, stateDigest, stateUnavailable, probabilities, result, evidence };
+  return { timestamp: now().toISOString(), name: caller, caller, binding, catalogRevision, recoveryOf, priorOperatingPointId, requestedOperatingPoint, stateDigest, stateUnavailable, probabilities, result, evidence };
 }
 
 async function ensureLogDirectory(directory: string): Promise<void> {

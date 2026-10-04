@@ -282,7 +282,7 @@ describe("appendRouterDecision records", () => {
     const records = await readRecords(paths.decisions);
     expect(records).toHaveLength(1);
     const record = records[0]!;
-    expect(Object.keys(record)).toEqual(["timestamp", "name", "caller", "binding", "catalogRevision", "recoveryOf", "priorOperatingPointId", "stateDigest", "stateUnavailable", "probabilities", "result", "evidence"]);
+    expect(Object.keys(record)).toEqual(["timestamp", "name", "caller", "binding", "catalogRevision", "recoveryOf", "priorOperatingPointId", "requestedOperatingPoint", "stateDigest", "stateUnavailable", "probabilities", "result", "evidence"]);
     expect(record.timestamp).toBe("2026-09-18T10:00:00.000Z");
     expect(record.name).toBe("oom-hunt");
     expect(record.caller).toBe("oom-hunt");
@@ -294,6 +294,7 @@ describe("appendRouterDecision records", () => {
     expect(record.catalogRevision).toBeNull();
     expect(record.recoveryOf).toBeNull();
     expect(record.priorOperatingPointId).toBeNull();
+    expect(record.requestedOperatingPoint).toBeNull();
     expect(record.result).toMatchObject({
       kind: "admitted",
       quality: "not_rejected",
@@ -389,13 +390,14 @@ describe("appendRouterDecision records", () => {
   it("persists the catalog revision and recovery lineage on a recovery route", async () => {
     const root = await tempdir();
     await appendRouterDecision(
-      entry({ catalogRevision: "a".repeat(64), recoveryOf: "run-7", priorOperatingPointId: "pi:old:low" }),
+      entry({ catalogRevision: "a".repeat(64), recoveryOf: "run-7", priorOperatingPointId: "pi:old:low", requestedOperatingPoint: "pi:pi-model:low" }),
       { root },
     );
     const record = (await readRecords(routerLogPaths(root).decisions))[0]!;
     expect(record.catalogRevision).toBe("a".repeat(64));
     expect(record.recoveryOf).toBe("run-7");
     expect(record.priorOperatingPointId).toBe("pi:old:low");
+    expect(record.requestedOperatingPoint).toBe("pi:pi-model:low");
   });
 
   it("persists an explicit unavailable-state marker instead of a digest of unsent state", async () => {
@@ -465,6 +467,7 @@ describe("appendRouterDecision refusal", () => {
     { name: "priorOperatingPointId without recoveryOf", mutate: (input) => ({ ...input, priorOperatingPointId: "pi:x" }) },
     { name: "an unbounded recoveryOf", mutate: (input) => ({ ...input, recoveryOf: "", priorOperatingPointId: "pi:x" }) },
     { name: "an unbounded priorOperatingPointId", mutate: (input) => ({ ...input, recoveryOf: "run-1", priorOperatingPointId: "" }) },
+    { name: "a requestedOperatingPoint carrying a newline", mutate: (input) => ({ ...input, requestedOperatingPoint: "pi:x\ny" }) },
     { name: "a malformed unavailable marker", mutate: (input) => ({ ...input, state: { status: "unavailable", reason: "other" } }) },
     { name: "an unavailable marker carrying task", mutate: (input) => ({ ...input, state: { status: "unavailable", reason: "catalog_unavailable", task: state().task } }) },
     { name: "a non-record state", mutate: (input) => ({ ...input, state: "junk" }) },

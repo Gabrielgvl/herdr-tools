@@ -1225,6 +1225,44 @@ describe("herdr_launch task cutover", () => {
     }
   });
 
+  it("routes an explicit operatingPoint as the only chain member", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    const harness = makeCli();
+    const handoffs = fakeHandoffs();
+    const supervision = stubSupervision();
+    const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, supervision, routerLog }), task({ operatingPoint: "pi:fallback:low" }));
+    // Only the requested point is attempted and bound — never the chain head.
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
+    expect(result.details!.children).toHaveLength(1);
+    expect(harness.starts).toBe(1);
+    const startArgv = harness.calls.find((argv) => argv[0] === "agent" && argv[1] === "start")!;
+    expect(startArgv[startArgv.indexOf("--model") + 1]).toBe("fallback");
+    expect(handoffs.selectCandidate).toHaveBeenCalledWith(expect.anything(), "pi:fallback:low", "pi", { available: false, reason: "no-readback-seam" });
+    expect(supervision.bound[0]).toMatchObject({ operatingPointId: "pi:fallback:low" });
+    // The single-member chain persists no fallback candidates, and the exact
+    // request rides the two existing provenance records.
+    const [, identityArg, provenanceArg] = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls[0]! as [HandoffAllocation, HandoffRunIdentity, { task: LaunchTask }];
+    expect(identityArg.child.fallbackCandidates).toEqual([]);
+    expect(provenanceArg.task).toMatchObject({ operatingPoint: "pi:fallback:low" });
+    expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({ requestedOperatingPoint: "pi:fallback:low" }), expect.anything());
+  });
+
+  it("fails without substitution when the explicit operatingPoint's start fails", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    const harness = makeCli({
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } }); },
+    });
+    const result = await execute(toolFor({ catalog, cli: harness.cli }), task({ operatingPoint: "pi:fallback:low" }));
+    // The single-member chain is the whole fallback contract: one attempt on
+    // the requested point, then the existing exhaustion failure.
+    expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+    expect(harness.starts).toBe(1);
+    const startArgv = harness.calls.find((argv) => argv[0] === "agent" && argv[1] === "start")!;
+    expect(startArgv[startArgv.indexOf("--model") + 1]).toBe("fallback");
+  });
+
   it("falls through an AGY quota-class pre-spawn failure and reports the launched PI child", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-quota-fallback-"));
     mkdirSync(join(root, ".git"));
@@ -1827,6 +1865,9 @@ tierChains:
     const abstained = await toolFor({ catalog, cli: makeCli().cli, catalogLoad: async () => { throw new Error("catalog unavailable"); }, routerLog: catalogRouterLog }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
     expect(abstained.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
     expect(catalogRouterLog).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "abstained", reason: "catalog_unavailable" }) }), expect.anything());
+    const requestedAbstained = await toolFor({ catalog, cli: makeCli().cli, catalogLoad: async () => { throw new Error("catalog unavailable"); }, routerLog: catalogRouterLog }).execute("call", task({ operatingPoint: "pi:pi-model:low" }), new AbortController().signal, undefined, extensionContext);
+    expect(requestedAbstained.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
+    expect(catalogRouterLog).toHaveBeenLastCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "abstained", reason: "catalog_unavailable" }), requestedOperatingPoint: "pi:pi-model:low" }), expect.anything());
     const transportFailure = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
     expect(transportFailure.details).toMatchObject({ outcome: "abstained", children: [] });
     const noPoints = await toolFor({ catalog: { ...catalog, points: [] }, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);

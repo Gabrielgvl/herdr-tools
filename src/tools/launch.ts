@@ -2262,6 +2262,8 @@ type TaskRouteRecord = {
   recoveryOf?: string;
   /** Recovery lineage for the decision log: the failed prior operating point. */
   priorOperatingPointId?: string;
+  /** The caller's exact `operatingPoint` request, if any. */
+  requestedOperatingPoint?: string;
 };
 
 /** The attempt-evidence identity of one chain point: exact id included. */
@@ -2322,6 +2324,7 @@ function taskRouteLogEntry(launchId: string, record: TaskRouteRecord): SpecRoute
     ...(record.binding === undefined ? {} : { binding: record.binding }),
     ...(record.catalogRevision === undefined ? {} : { catalogRevision: record.catalogRevision }),
     ...(record.recoveryOf === undefined ? {} : { recoveryOf: record.recoveryOf, priorOperatingPointId: record.priorOperatingPointId }),
+    ...(record.requestedOperatingPoint === undefined ? {} : { requestedOperatingPoint: record.requestedOperatingPoint }),
     ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
     ...(record.response === undefined ? {} : { probabilities: record.response }),
     ...(record.state === undefined ? {} : { state: record.state })
@@ -2347,12 +2350,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
    */
   const routeTaskOnce = async (params: NormalizedLaunchTask, task: RoutingTask, launchId: string, signal: AbortSignal, ctx: ExtensionContext, recovery?: RecoveryContext): Promise<{ catalog?: Catalog; record: TaskRouteRecord }> => {
     const root = deps.cwd ?? ctx.cwd;
+    const requested = params.operatingPoint === undefined ? {} : { requestedOperatingPoint: params.operatingPoint };
     let catalog: Catalog;
     try {
       catalog = await loadLaunchCatalog();
     } catch {
       return {
-        record: { task, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" } }
+        record: { task, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" }, ...requested }
       };
     }
 
@@ -2392,7 +2396,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     if (evaluation.kind === "response") {
       response = evaluation.response;
       try {
-        decision = await routeTask({ task, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId, priorRouteTier: recovery.priorRouteTier, ...(recovery.priorFailureCause === undefined ? {} : { priorFailureCause: recovery.priorFailureCause }) } }) });
+        decision = await routeTask({ task, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(params.operatingPoint === undefined ? {} : { operatingPoint: params.operatingPoint }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId, priorRouteTier: recovery.priorRouteTier, ...(recovery.priorFailureCause === undefined ? {} : { priorFailureCause: recovery.priorFailureCause }) } }) });
       } catch {
         decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
       }
@@ -2408,7 +2412,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         state,
         binding,
         ...(catalog.catalogRevision === undefined ? {} : { catalogRevision: catalog.catalogRevision }),
-        ...(recovery === undefined ? {} : { recoveryOf: recovery.runId, priorOperatingPointId: recovery.priorOperatingPointId })
+        ...(recovery === undefined ? {} : { recoveryOf: recovery.runId, priorOperatingPointId: recovery.priorOperatingPointId }),
+        ...requested
       }
     };
   };
@@ -2590,7 +2595,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           ...(params.recoveryOf === undefined ? {} : { recoveryOf: params.recoveryOf }),
           ...(params.label === undefined ? {} : { label: params.label }),
           ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
-          ...(params.retention === undefined ? {} : { retention: params.retention })
+          ...(params.retention === undefined ? {} : { retention: params.retention }),
+          ...(params.operatingPoint === undefined ? {} : { operatingPoint: params.operatingPoint })
         }
       });
 
@@ -2857,7 +2863,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
          * manual close-then-recovery contract stands.
          */
         const providerLimitRecovery = async (identity: SupervisedIdentity, quota: ClaudeQuotaEvidence): Promise<ProviderLimitRecoveryEvidence | undefined> => {
-          if (!quota.zeroProgressProven) return undefined;
+          // An explicit point is never re-issued as an ordinary Task.
+          if (!quota.zeroProgressProven || params.operatingPoint !== undefined) return undefined;
           const recoverySignal = ctx.signal ?? new AbortController().signal;
           // The dead pane is provably closed before anything new may start —
           // a close whose effect stays uncertain never reaches the relaunch.

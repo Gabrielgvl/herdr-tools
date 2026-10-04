@@ -55,6 +55,16 @@ describe("DaemonLaunchRequestSchema", () => {
       expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, retention: bad }, idempotencyKey: "k" }), String(bad)).toBe(false);
     }
   });
+
+  it("accepts a bounded operatingPoint and rejects empty, line-broken, and over-length values", () => {
+    expect(Value.Check(LaunchTaskSchema, { ...task, operatingPoint: "pi:openai-codex/gpt-6-luna:low" })).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...task, operatingPoint: "x".repeat(128) })).toBe(true);
+    expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, operatingPoint: "pi:openai-codex/gpt-6-luna:low" }, idempotencyKey: "k" })).toBe(true);
+    for (const bad of ["", "has\nnewline", "x".repeat(129)]) {
+      expect(Value.Check(LaunchTaskSchema, { ...task, operatingPoint: bad }), bad).toBe(false);
+      expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, operatingPoint: bad }, idempotencyKey: "k" }), bad).toBe(false);
+    }
+  });
 });
 
 describe("live launch surface (zero-impact guard)", () => {

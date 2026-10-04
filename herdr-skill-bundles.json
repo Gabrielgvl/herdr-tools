@@ -39,7 +39,7 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "c9ef698f0d40aefb990041c8867307bf10592e72ed8004729d4c76ef4f141981"
+      "treeHash": "88efb02b6f3b62d7308fc46cea99e49852eb001b25ec5c48e6e4687e4617cf0f"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -119,7 +119,7 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "c9ef698f0d40aefb990041c8867307bf10592e72ed8004729d4c76ef4f141981"
+      "treeHash": "88efb02b6f3b62d7308fc46cea99e49852eb001b25ec5c48e6e4687e4617cf0f"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",

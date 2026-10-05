@@ -4636,6 +4636,40 @@ describe("managed handoff evaluation", () => {
     }
   });
 
+  for (const completionReads of [true, false]) {
+    it(`accepts a current artifact from an authoritative same-status snapshot without a lifecycle transition and never repair-prompts (${completionReads ? "launch" : "reattach"} bind)`, async () => {
+      const prompts: string[] = [];
+      const idle = () => snapshot([paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })]);
+      const { gate, h, allocation } = await managed({ snapshots: [idle()], repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+      const validations = countValidations(gate);
+      try {
+        if (completionReads) {
+          const signal = vi.fn().mockResolvedValue(false);
+          h.supervisor.onCompletionSignal(signal);
+          await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+        }
+        // A missing artifact on a same-status snapshot is checked, never repaired.
+        await h.supervisor.onReconciliationSnapshot(idle());
+        // Every serialized snapshot drains the check the previous one queued.
+        await h.supervisor.onReconciliationSnapshot(invalidDestination("p1"));
+        const checked = validations();
+        await writeArtifact(allocation, "done");
+        // Duplicate target records are invalid evidence: the current artifact is never even read.
+        await h.supervisor.onReconciliationSnapshot(invalidDestination("p1"));
+        expect(validations()).toBe(checked);
+        expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+        await h.supervisor.onReconciliationSnapshot(idle());
+        await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+        expect(prompts).toHaveLength(0);
+        expect((await readHandoffState(allocation)).repair).toEqual({ attempts: 0, fence: null });
+        expect(h.supervisor.view().transitions).toEqual([]);
+      } finally {
+        h.supervisor.shutdown();
+        await rm(allocation.namespaceDir, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("keeps a blocked child in repair when its artifact reports done", async () => {
     const prompts: Array<{ paneId: string; text: string }> = [];
     const { h, allocation, run } = await managed({ repairPrompt: async (paneId, text) => { prompts.push({ paneId, text }); } });

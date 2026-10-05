@@ -1640,6 +1640,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     this.markReconciliationSuccess();
     this.applySnapshotRevision(occupant);
+    // ADR-031: a current artifact is accepted on any authoritative terminal
+    // observation, not only behind a folded transition — a lane's lifecycle
+    // can stay unmoved. Accept-only: repair stays transition-driven.
+    this.scheduleHandoffEvaluation(false);
   }
 
   private applySnapshotRevision(occupant: AuthoritativeOccupant): void {
@@ -2500,9 +2504,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * Queue a managed terminal observation for gated evaluation on the mutation
    * chain, behind the fold that produced it and ahead of later evidence.
    */
-  private scheduleHandoffEvaluation(): void {
+  private scheduleHandoffEvaluation(repair = true): void {
     if (this.deps.handoffs === undefined || this.stopped || this.isSettled()) return;
-    void this.serialize(() => this.evaluateHandoff()).catch(() => undefined);
+    void this.serialize(() => this.evaluateHandoff(repair)).catch(() => undefined);
   }
 
   /** The bounded diagnostic sink — a throwing one must never disturb supervision. */
@@ -2534,8 +2538,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * prompt per artifact version, fenced and persisted before any send.
    * Supervision stays active either way — a missing or invalid artifact is a
    * repair signal, never a settlement and never evidence.
+   * An accept-only check (`repair` false) never prompts.
    */
-  private async evaluateHandoff(): Promise<void> {
+  private async evaluateHandoff(repair = true): Promise<void> {
     if (this.stopped || this.isSettled()) return;
     if (this.status !== "idle" && this.status !== "done" && this.status !== "blocked") return;
     const managed = this.managedRun();
@@ -2559,7 +2564,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       if (!this.retired) this.retireAfterHandoff(run.runId);
       return;
     }
-    if (this.retired) return;
+    if (this.retired || !repair) return;
     // A typed provider limit cannot justify a repair prompt. Before repairing,
     // give the existing bounded native-session reads time to see a late 429;
     // a valid artifact above still wins without waiting.
